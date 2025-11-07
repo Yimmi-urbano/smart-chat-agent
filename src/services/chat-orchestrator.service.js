@@ -1330,5 +1330,83 @@ class ChatOrchestratorService {
   }
 }
 
+  async processMessageStream({ userMessage, userId, domain, forceModel, res }) {
+    const startTime = Date.now();
+    const FILE_NAME = 'chat-orchestrator.service.js';
+    // Lógica principal de processMessage pero adaptada para streaming
+    // PASO 1: PREPARACIÓN
+    let conversation = await this.getOrCreateConversation(userId, domain);
+    let systemPrompt = await this.getSystemPrompt(conversation, domain);
+    const history = this.getRecentHistory(conversation);
+
+    // PASO 2: INTERPRETACIÓN Y TOOLS (simplificado para el stream inicial)
+    // En una implementación real y compleja, podrías tener una primera llamada para decidir si usar tools
+    // y luego hacer el stream. Por simplicidad aquí, asumimos que el streaming es para respuestas directas.
+
+    // PASO 3: GENERACIÓN
+    const selectedModel = forceModel || ModelRouterService.decideModel(userMessage, history);
+    const finalSystemPrompt = systemPrompt; // En un caso real, podría ser dinámico
+
+    let responseStream;
+    let usedModel = selectedModel;
+
+    if (selectedModel === 'gemini') {
+      const thinkingUsed = ModelRouterService.shouldUseThinking(userMessage);
+      responseStream = await this.geminiService.generateResponse(userMessage, history, domain, finalSystemPrompt, thinkingUsed, true);
+    } else {
+      responseStream = await this.openaiService.generateResponse(userMessage, history, domain, finalSystemPrompt, true);
+    }
+
+    // Procesar el stream, enviar al cliente y acumular la respuesta
+    let fullResponseMessage = '';
+    for await (const chunk of responseStream) {
+      const text = chunk.choices[0]?.delta?.content || (chunk.text && chunk.text()) || '';
+      if (text) {
+        fullResponseMessage += text;
+        res.write(`data: ${JSON.stringify({ text })}\n\n`);
+      }
+    }
+
+    // PASO 4 y 5: VALIDACIÓN Y PERSISTENCIA (después de recibir la respuesta completa)
+    const responseForPersistence = {
+      message: fullResponseMessage,
+      // Aquí podrías parsear `fullResponseMessage` si esperas un JSON, o realizar otra llamada al LLM
+      // para generar los campos faltantes como `audio_description` y `action`.
+      // Por simplicidad, los dejaremos como están.
+      audio_description: fullResponseMessage.substring(0, 150),
+      action: { type: 'none' },
+      usage: {}, // La información de tokens no está disponible fácilmente en streams
+    };
+
+    // Ahora ejecuta la lógica de persistencia con la respuesta completa
+    await this.saveConversation(conversation, userMessage, responseForPersistence, usedModel, fullResponseMessage, startTime);
+  }
+
+  async getSystemPrompt(conversation, domain) {
+    // ... lógica para obtener o crear el system prompt ...
+    // Esta es una simplificación de la lógica que ya tienes en processMessage
+    if (conversation.messages && conversation.messages.length > 0 && conversation.messages[0].role === 'system') {
+      return conversation.messages[0].content;
+    }
+    return PromptMemoryService.buildSystemPrompt(domain);
+  }
+
+  async saveConversation(conversation, userMessage, response, usedModel, fullResponseMessage, startTime) {
+    // ... lógica de persistencia extraída de processMessage ...
+    // Esto incluiría guardar los mensajes del usuario y del asistente,
+    // calcular tokens si es posible, y actualizar metadatos.
+    conversation.messages.push({ role: 'user', content: userMessage, timestamp: new Date() });
+    conversation.messages.push({
+      role: 'assistant',
+      content: fullResponseMessage,
+      timestamp: new Date(),
+      metadata: { model: usedModel },
+    });
+    conversation.metadata.totalMessages += 2;
+    await conversation.save();
+    logger.info(`[${'chat-orchestrator.service.js'}] ✅ Conversación guardada post-stream.`);
+  }
+}
+
 module.exports = ChatOrchestratorService;
 

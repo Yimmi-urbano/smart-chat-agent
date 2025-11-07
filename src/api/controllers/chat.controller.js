@@ -20,7 +20,7 @@ class ChatController {
    */
   async sendMessage(req, res) {
     try {
-      const { userMessage, domain, userId, forceModel } = req.body;
+      const { userMessage, domain, userId, forceModel, stream } = req.body;
 
       // Validaciones básicas
       if (!userMessage || !domain || !userId) {
@@ -39,19 +39,38 @@ class ChatController {
 
       logger.info(`[Chat] Processing message from user ${userId} on domain ${domain}`);
 
-      // Procesar mensaje
-      const response = await this.orchestrator.processMessage({
-        userMessage,
-        userId,
-        domain,
-        forceModel,
-      });
+      if (stream) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
 
-      return ResponseUtil.success(res, response, 'Message processed successfully');
+        // El orquestador se encargará de escribir en el stream y de la persistencia.
+        await this.orchestrator.processMessageStream({
+          userMessage,
+          userId,
+          domain,
+          forceModel,
+          res, // Pasamos el objeto de respuesta para el streaming
+        });
 
+        res.end();
+      } else {
+        // Procesamiento normal sin streaming
+        const response = await this.orchestrator.processMessage({
+          userMessage,
+          userId,
+          domain,
+          forceModel,
+        });
+
+        return ResponseUtil.success(res, response, 'Message processed successfully');
+      }
     } catch (error) {
       logger.error('[Chat] Error in sendMessage:', error);
-      return ResponseUtil.serverError(res, 'Failed to process message');
+      // Asegurarse de que no se envíe una respuesta de error si el stream ya comenzó
+      if (!res.headersSent) {
+        return ResponseUtil.serverError(res, 'Failed to process message');
+      }
     }
   }
 

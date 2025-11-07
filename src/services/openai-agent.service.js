@@ -244,7 +244,7 @@ class OpenAIAgentService {
    * Esto reduce tokens en 85-95% en mensajes subsecuentes
    * OPTIMIZACIÓN: Usa function calling para buscar productos sin enviarlos en el prompt
    */
-  async generateResponse(userMessage, conversationHistory, domain, systemPrompt) {
+  async generateResponse(userMessage, conversationHistory, domain, systemPrompt, stream = false) {
     const FILE_NAME = 'openai-agent.service.js';
     
     try {
@@ -300,6 +300,7 @@ class OpenAIAgentService {
         max_tokens: config.openai.maxTokens,
         tools: this.tools,
         tool_choice: 'auto', // Permite que el modelo decida cuándo usar las funciones
+        stream,
       };
 
       // MEJORA: Agregar prompt caching si está habilitado
@@ -307,7 +308,12 @@ class OpenAIAgentService {
         logger.info(`[OpenAI] Prompt caching enabled (system prompt hash: ${systemPromptHash.substring(0, 8)}...)`);
       }
 
-      let completion = await this.client.chat.completions.create(requestOptions);
+      const completion = await this.client.chat.completions.create(requestOptions);
+
+      if (stream) {
+        return completion;
+      }
+
       let message = completion.choices[0].message;
       let functionResults = [];
 
@@ -337,11 +343,12 @@ class OpenAIAgentService {
         }
 
         // Obtener respuesta final del modelo
-        completion = await this.client.chat.completions.create({
+        const newCompletion = await this.client.chat.completions.create({
           ...requestOptions,
           messages: messagesForAPI,
+          stream: false, // El segundo paso no puede ser stream
         });
-        message = completion.choices[0].message;
+        message = newCompletion.choices[0].message;
       }
 
       // Parsear respuesta final

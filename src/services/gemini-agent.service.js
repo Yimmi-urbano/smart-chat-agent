@@ -263,7 +263,7 @@ class GeminiAgentService {
    * 
    * MEJORA: Mantiene el system prompt en el historial (memorizado)
    */
-  async generateResponse(userMessage, conversationHistory, domain, systemPrompt, useThinking = false) {
+  async generateResponse(userMessage, conversationHistory, domain, systemPrompt, useThinking = false, stream = false) {
     try {
       // OPTIMIZACIÓN: Usar prompt corto después del primer mensaje para reducir tokens
       const PromptMemoryService = require('./prompt-memory.service');
@@ -341,6 +341,11 @@ class GeminiAgentService {
         history: messages.slice(0, -1),
         tools: [{ functionDeclarations: this.tools }],
       });
+
+      if (stream) {
+        const result = await chat.sendMessageStream(messages[messages.length - 1].parts[0].text);
+        return result.stream;
+      }
 
       const result = await chat.sendMessage(messages[messages.length - 1].parts[0].text);
       
