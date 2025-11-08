@@ -4,6 +4,9 @@
  * ============================================
  * Orquesta la comunicación entre el router, los modelos
  * y la persistencia de conversaciones
+ *
+ * MEJORA CLAVE: Memoriza el system prompt y lo mantiene
+ * en el historial para evitar reenviarlo en cada mensaje
  */
 
 const GeminiAgentService = require('./gemini-agent.service');
@@ -25,67 +28,6 @@ class ChatOrchestratorService {
     this.openaiService = new OpenAIAgentService();
   }
 
-  async processMessage({ userMessage, userId, domain, forceModel = null }) {
-    const startTime = Date.now();
-    const FILE_NAME = 'chat-orchestrator.service.js';
-    logger.info(`[${FILE_NAME}] 🔄 INICIANDO PROCESAMIENTO DE MENSAJE (NO-STREAM)`);
-
-    try {
-        let conversation = await this.getOrCreateConversation(userId, domain);
-        const { systemPrompt, history, interpretedIntent, toolResult, dynamicPrompt } = await this._prepareConversation(userMessage, conversation, domain);
-        const finalSystemPrompt = dynamicPrompt || systemPrompt;
-
-        let response;
-        let usedModel;
-        let thinkingUsed = false;
-        let fallbackUsed = false;
-
-        const selectedModel = forceModel || ModelRouterService.decideModel(userMessage, history);
-        logger.info(`[${FILE_NAME}] [PASO 3/5] Modelo seleccionado: ${selectedModel}`);
-
-        try {
-            if (selectedModel === 'gemini') {
-                thinkingUsed = ModelRouterService.shouldUseThinking(userMessage);
-                response = await this.geminiService.generateResponse(userMessage, history, domain, finalSystemPrompt, thinkingUsed);
-                usedModel = 'gemini';
-            } else {
-                response = await this.openaiService.generateResponse(userMessage, history, domain, finalSystemPrompt);
-                usedModel = 'openai';
-            }
-        } catch (error) {
-            logger.error(`[${FILE_NAME}] ❌ Error inicial con ${selectedModel}: ${error.message}`);
-            fallbackUsed = true;
-            const fallbackResponse = await this._performFallback(selectedModel, userMessage, history, domain, finalSystemPrompt);
-            response = fallbackResponse.response;
-            usedModel = fallbackResponse.usedModel;
-        }
-
-        const finalResponse = await this._finalizeAndPersistConversation({
-            response,
-            conversation,
-            userMessage,
-            history,
-            interpretedIntent,
-            toolResult,
-            systemPrompt,
-            dynamicPrompt,
-            usedModel,
-            thinkingUsed,
-            fallbackUsed,
-            domain,
-            userId,
-            startTime,
-        });
-
-        logger.info(`[${FILE_NAME}] ✅ PROCESAMIENTO (NO-STREAM) COMPLETADO en ${Date.now() - startTime}ms`);
-        return finalResponse;
-
-    } catch (error) {
-        logger.error(`[${FILE_NAME}] ❌ ERROR CRÍTICO en processMessage: ${error.message}`, { stack: error.stack });
-        throw error;
-    }
-  }
-
   async processMessageStream({ userMessage, userId, domain, forceModel = null, res }) {
     const startTime = Date.now();
     const FILE_NAME = 'chat-orchestrator.service.js';
@@ -101,6 +43,7 @@ class ChatOrchestratorService {
         logger.info(`[${FILE_NAME}] [PASO 3/5] Modelo seleccionado para stream: ${selectedModel}`);
 
         let stream;
+        let usagePromise = null;
         let usedModel = selectedModel;
         let thinkingUsed = false;
         let fallbackUsed = false;
@@ -108,7 +51,9 @@ class ChatOrchestratorService {
         try {
             if (selectedModel === 'gemini') {
                 thinkingUsed = ModelRouterService.shouldUseThinking(userMessage);
-                stream = await this.geminiService.generateResponseStream(userMessage, history, domain, finalSystemPrompt, thinkingUsed);
+                const geminiResult = await this.geminiService.generateResponseStream(userMessage, history, domain, finalSystemPrompt, thinkingUsed);
+                stream = geminiResult.stream;
+                usagePromise = geminiResult.usagePromise;
             } else {
                 stream = await this.openaiService.generateResponseStream(userMessage, history, domain, finalSystemPrompt);
             }
@@ -120,23 +65,34 @@ class ChatOrchestratorService {
                 logger.warn(`[${FILE_NAME}] Intentando fallback de stream a ${fallbackModel}...`);
                 if (fallbackModel === 'gemini') {
                     thinkingUsed = ModelRouterService.shouldUseThinking(userMessage);
-                    stream = await this.geminiService.generateResponseStream(userMessage, history, domain, finalSystemPrompt, thinkingUsed);
+                    const geminiResult = await this.geminiService.generateResponseStream(userMessage, history, domain, finalSystemPrompt, thinkingUsed);
+                    stream = geminiResult.stream;
+                    usagePromise = geminiResult.usagePromise;
                 } else {
                     stream = await this.openaiService.generateResponseStream(userMessage, history, domain, finalSystemPrompt);
                 }
                 usedModel = fallbackModel;
             } catch (fallbackError) {
                 logger.error(`[${FILE_NAME}] ❌ Fallback de stream también falló: ${fallbackError.message}`);
-                if (!res.headersSent) {
-                    res.write('event: error\ndata: {"message": "Lo siento, estoy teniendo problemas técnicos."}\n\n');
-                }
+                if (!res.headersSent) res.write('event: error\ndata: {"message": "Lo siento, estoy teniendo problemas técnicos."}\n\n');
                 return;
             }
         }
 
         let fullResponseMessage = '';
+        let tokenData = { input: 0, output: 0, thinking: 0, cached: 0, total: 0 };
+
         if (usedModel === 'openai') {
             for await (const chunk of stream) {
+                if (chunk.usage) {
+                    logger.info(`[${FILE_NAME}] Received usage data from OpenAI stream`, chunk.usage);
+                    tokenData = {
+                        input: chunk.usage.prompt_tokens || 0,
+                        output: chunk.usage.completion_tokens || 0,
+                        total: chunk.usage.total_tokens || 0,
+                        cached: 0, thinking: 0,
+                    };
+                }
                 const content = chunk.choices[0]?.delta?.content || '';
                 if (content) {
                     fullResponseMessage += content;
@@ -151,14 +107,17 @@ class ChatOrchestratorService {
                     res.write(`data: ${JSON.stringify({ message: content })}\n\n`);
                 }
             }
+            if (usagePromise) {
+                tokenData = await usagePromise;
+            }
         }
 
         logger.info(`[${FILE_NAME}] ✅ Stream finalizado. Respuesta completa: "${fullResponseMessage.substring(0, 100)}..."`);
 
         const responseForPersistence = {
             message: fullResponseMessage,
-            usage: { input: 0, output: 0, thinking: 0, cached: 0, total: 0 },
-            usageMetadata: { promptTokenCount: 0, candidatesTokenCount: 0, thinkingTokenCount: 0 },
+            usage: tokenData,
+            usageMetadata: {}, // Let _finalizeAndPersistConversation handle this from usage
         };
 
         await this._finalizeAndPersistConversation({
@@ -198,23 +157,23 @@ class ChatOrchestratorService {
         const history = this.getRecentHistory(conversation);
         logger.info(`[${FILE_NAME}] [PASO 1/5] ✅ Preparación completa`);
 
-    logger.info(`[${FILE_NAME}] [PASO 2/5] INTERPRETACIÓN: Analizando intención...`);
-    let interpretedIntent = null;
-    let toolResult = null;
-    let dynamicPrompt = null;
-    try {
-        interpretedIntent = await IntentInterpreterService.interpret(userMessage, 'es', domain);
-        if (interpretedIntent.intent !== 'general_chat' && interpretedIntent.confidence >= 0.6) {
-            toolResult = await ToolExecutorService.executeTool(interpretedIntent.intent, interpretedIntent.params, domain);
-            if (toolResult) {
-                dynamicPrompt = this.buildDynamicPrompt(interpretedIntent.intent, toolResult, systemPrompt, domain);
-                logger.info(`[${FILE_NAME}] [PASO 2/5] ✅ Tool ejecutado: ${toolResult.tool}`);
+        logger.info(`[${FILE_NAME}] [PASO 2/5] INTERPRETACIÓN: Analizando intención...`);
+        let interpretedIntent = null;
+        let toolResult = null;
+        let dynamicPrompt = null;
+        try {
+            interpretedIntent = await IntentInterpreterService.interpret(userMessage, 'es', domain);
+            if (interpretedIntent.intent !== 'general_chat' && interpretedIntent.confidence >= 0.6) {
+                toolResult = await ToolExecutorService.executeTool(interpretedIntent.intent, interpretedIntent.params, domain);
+                if (toolResult) {
+                    dynamicPrompt = this.buildDynamicPrompt(interpretedIntent.intent, toolResult, systemPrompt, domain);
+                    logger.info(`[${FILE_NAME}] [PASO 2/5] ✅ Tool ejecutado: ${toolResult.tool}`);
+                }
             }
+        } catch (error) {
+            logger.error(`[${FILE_NAME}] [PASO 2/5] ❌ Error en interpretación: ${error.message}`);
         }
-    } catch (error) {
-        logger.error(`[${FILE_NAME}] [PASO 2/5] ❌ Error en interpretación: ${error.message}`);
-    }
-     return { systemPrompt, history, interpretedIntent, toolResult, dynamicPrompt };
+        return { systemPrompt, history, interpretedIntent, toolResult, dynamicPrompt };
     } catch (error) {
         logger.error(`[${FILE_NAME}] ❌ ERROR FATAL en _prepareConversation: ${error.message}`);
         throw new Error('No se pudo preparar la conversación: ' + error.message);
@@ -296,7 +255,7 @@ class ChatOrchestratorService {
         role: 'assistant',
         content: response.message,
         timestamp: new Date(),
-        metadata: { model: usedModel, tokens: tokenData, action: validatedAction, promptLength: promptFull.length },
+        metadata: { model: usedModel, tokens: tokenData, action: validatedAction, promptLength: promptFull.length, thinkingUsed, fallbackUsed, intent_interpreted: interpretedIntent, tool_executed: toolResult },
     });
 
     conversation.metadata.totalMessages = (conversation.metadata.totalMessages || 0) + 2;
@@ -315,17 +274,25 @@ class ChatOrchestratorService {
         audio_description: response.audio_description,
         action: validatedAction,
         model_used: usedModel,
+        tokens: tokenData,
+        cost,
         response_time_ms: responseTime,
         conversation_id: conversation._id,
+        thinking_used: thinkingUsed,
+        fallback_used: fallbackUsed,
+        intent_interpreted: interpretedIntent,
+        tool_executed: toolResult,
     };
   }
 
-  // ============================================
-  // ORIGINAL HELPER METHODS
-  // ============================================
-
+  /**
+   * Busca un producto en TODOS los lugares posibles (función unificada)
+   * Prioridad: toolResult > mensaje asistente > mensaje usuario > contexto persistente
+   */
   async findProductAnywhere({ toolResult, responseMessage, userMessage, history, conversation, domain }) {
     const FILE_NAME = 'chat-orchestrator.service.js';
+
+    // PRIORIDAD 1: Producto del toolResult (más confiable)
     if (toolResult && toolResult.data) {
       if (toolResult.data.products && toolResult.data.products.length > 0) {
         const product = toolResult.data.products[0];
@@ -336,6 +303,8 @@ class ChatOrchestratorService {
         return { product: toolResult.data, source: 'toolResult' };
       }
     }
+
+    // PRIORIDAD 2: Producto del mensaje del asistente
     if (responseMessage && responseMessage.length > 10) {
       const extracted = await this.extractProductFromMessage(responseMessage, domain);
       if (extracted) {
@@ -343,6 +312,8 @@ class ChatOrchestratorService {
         return { product: extracted, source: 'assistant_message' };
       }
     }
+
+    // PRIORIDAD 3: Producto del mensaje del usuario
     if (userMessage && userMessage.length > 5) {
       const extracted = await this.findProductByNameInMessage(userMessage, domain);
       if (extracted) {
@@ -350,14 +321,20 @@ class ChatOrchestratorService {
         return { product: extracted, source: 'user_message' };
       }
     }
+
+    // PRIORIDAD 4: Producto del contexto persistente (último recurso)
     const productInHistory = this.findProductInHistory(history, conversation);
     if (productInHistory && productInHistory.fullData) {
       logger.info(`[${FILE_NAME}] findProductAnywhere() - ✅ Producto encontrado en contexto: ${productInHistory.fullData.title}`);
       return { product: productInHistory.fullData, source: 'conversation_context' };
     }
+
     return null;
   }
 
+  /**
+   * Construye una acción add_to_cart desde un producto
+   */
   buildActionFromProduct(product, quantity = 1) {
     return {
       type: 'add_to_cart',
@@ -372,6 +349,79 @@ class ChatOrchestratorService {
     };
   }
 
+  /**
+   * Procesa un mensaje del usuario (VERSIÓN OPTIMIZADA - 5 PASOS)
+   *
+   * PASO 1: PREPARACIÓN (Conversación, System Prompt, Historial)
+   * PASO 2: INTERPRETACIÓN Y TOOLS (Intención, Tools, Prompt Dinámico)
+   * PASO 3: GENERACIÓN (Modelo, Respuesta, Fallback)
+   * PASO 4: VALIDACIÓN (Construcción de Acción)
+   * PASO 5: PERSISTENCIA (Guardar mensajes, métricas, respuesta)
+   */
+  async processMessage({ userMessage, userId, domain, forceModel = null }) {
+    const startTime = Date.now();
+    const FILE_NAME = 'chat-orchestrator.service.js';
+    logger.info(`[${FILE_NAME}] 🔄 INICIANDO PROCESAMIENTO DE MENSAJE (NO-STREAM)`);
+
+    try {
+        let conversation = await this.getOrCreateConversation(userId, domain);
+        const { systemPrompt, history, interpretedIntent, toolResult, dynamicPrompt } = await this._prepareConversation(userMessage, conversation, domain);
+        const finalSystemPrompt = dynamicPrompt || systemPrompt;
+
+        let response;
+        let usedModel;
+        let thinkingUsed = false;
+        let fallbackUsed = false;
+
+        const selectedModel = forceModel || ModelRouterService.decideModel(userMessage, history);
+        logger.info(`[${FILE_NAME}] [PASO 3/5] Modelo seleccionado: ${selectedModel}`);
+
+        try {
+            if (selectedModel === 'gemini') {
+                thinkingUsed = ModelRouterService.shouldUseThinking(userMessage);
+                response = await this.geminiService.generateResponse(userMessage, history, domain, finalSystemPrompt, thinkingUsed);
+                usedModel = 'gemini';
+            } else {
+                response = await this.openaiService.generateResponse(userMessage, history, domain, finalSystemPrompt);
+                usedModel = 'openai';
+            }
+        } catch (error) {
+            logger.error(`[${FILE_NAME}] ❌ Error inicial con ${selectedModel}: ${error.message}`);
+            fallbackUsed = true;
+            const fallbackResponse = await this._performFallback(selectedModel, userMessage, history, domain, finalSystemPrompt);
+            response = fallbackResponse.response;
+            usedModel = fallbackResponse.usedModel;
+        }
+
+        const finalResponse = await this._finalizeAndPersistConversation({
+            response,
+            conversation,
+            userMessage,
+            history,
+            interpretedIntent,
+            toolResult,
+            systemPrompt,
+            dynamicPrompt,
+            usedModel,
+            thinkingUsed,
+            fallbackUsed,
+            domain,
+            userId,
+            startTime,
+        });
+
+        logger.info(`[${FILE_NAME}] ✅ PROCESAMIENTO (NO-STREAM) COMPLETADO en ${Date.now() - startTime}ms`);
+        return finalResponse;
+
+    } catch (error) {
+        logger.error(`[${FILE_NAME}] ❌ ERROR CRÍTICO en processMessage: ${error.message}`, { stack: error.stack });
+        throw error;
+    }
+  }
+
+  /**
+   * Obtiene o crea una conversación
+   */
   async getOrCreateConversation(userId, domain) {
     const Conversation = getConversationModel();
     let conversation = await Conversation.findOne({
@@ -386,32 +436,110 @@ class ChatOrchestratorService {
         domain,
         messages: [],
         status: 'active',
-        metadata: { totalMessages: 0, totalTokens: 0, modelsUsed: {}, averageResponseTime: 0 }
       });
-    } else if (!conversation.metadata) {
-        conversation.metadata = { totalMessages: 0, totalTokens: 0, modelsUsed: {}, averageResponseTime: 0 };
-    }
-    if (!conversation.messages) {
+      logger.info(`[Orchestrator] Created new conversation for user ${userId}`);
+    } else {
+      // Asegurarse de que messages esté inicializado
+      if (!conversation.messages) {
         conversation.messages = [];
+      }
+      logger.info(`[Orchestrator] Found existing conversation with ${conversation.messages.length} messages`);
     }
+
     return conversation;
   }
 
+  /**
+   * Obtiene historial reciente (últimos N mensajes)
+   * OPTIMIZACIÓN: Reduce el historial para ahorrar tokens
+   * IMPORTANTE: Siempre preserva el system prompt como primer mensaje
+   */
   getRecentHistory(conversation) {
+    const FILE_NAME = 'chat-orchestrator.service.js';
+
+    // OPTIMIZACIÓN: Aumentar a 6 mensajes (3 turnos) para mantener mejor contexto
+    // Esto asegura que referencias como "ver más detalles" tengan el contexto necesario
+    const maxHistory = Math.min(config.performance.maxConversationHistory || 10, 6);
     const messages = conversation.messages || [];
-    if (messages.length === 0) return [];
+
+    logger.info(`[${FILE_NAME}] getRecentHistory() - Total mensajes en conversación: ${messages.length}`);
+
+    if (messages.length === 0) {
+      return [];
+    }
+
+    // El primer mensaje siempre es el system prompt (memorizado)
     const systemMessage = messages[0].role === 'system' ? [messages[0]] : [];
+
+    // Tomar los últimos N mensajes (excluyendo el system prompt)
     const conversationMessages = messages.slice(systemMessage.length);
-    const recentMessages = conversationMessages.slice(-6);
-    return [...systemMessage, ...recentMessages];
+    const recentMessages = conversationMessages.slice(-maxHistory);
+
+    logger.info(`[${FILE_NAME}] getRecentHistory() - Mensajes de conversación: ${conversationMessages.length}, Tomando últimos ${maxHistory}: ${recentMessages.length}`);
+
+    // OPTIMIZACIÓN: Aumentar límite de caracteres para mantener contexto de productos
+    const MAX_MESSAGE_LENGTH = 500; // Máximo 500 caracteres por mensaje (antes 300)
+
+    // Combinar: system prompt + mensajes recientes (truncados)
+    // MEJORA: Incluir metadata en el historial para facilitar búsqueda de productos
+    const history = [...systemMessage, ...recentMessages].map((msg, index) => {
+      let content = msg.content || '';
+      const originalLength = content.length;
+
+      // MEJORA: Si el mensaje tiene metadata con información de producto, agregarla al contenido
+      // Esto ayuda a que el LLM y la búsqueda de productos tengan mejor contexto
+      if (msg.metadata && msg.metadata.lastProductShown) {
+        const productInfo = msg.metadata.lastProductShown;
+        // Agregar información del producto al final del mensaje para referencia
+        content += ` [PRODUCTO_MENCIONADO: ID=${productInfo.productId}, slug=${productInfo.slug}, título=${productInfo.title}]`;
+      } else if (msg.metadata && msg.metadata.action && msg.metadata.action.productId) {
+        const action = msg.metadata.action;
+        content += ` [PRODUCTO_ACCION: ID=${action.productId}${action.slug ? `, slug=${action.slug}` : ''}${action.title ? `, título=${action.title}` : ''}]`;
+      }
+
+      // Truncar mensajes muy largos (excepto el system prompt)
+      if (msg.role !== 'system' && content.length > MAX_MESSAGE_LENGTH) {
+        content = content.substring(0, MAX_MESSAGE_LENGTH) + '...';
+        logger.info(`[${FILE_NAME}] Truncated message ${index} (${msg.role}) from ${originalLength} to ${content.length} chars`);
+      }
+
+      return {
+      role: msg.role,
+        content: content,
+        metadata: msg.metadata, // Incluir metadata para búsqueda
+      };
+    });
+
+    // Log detallado del historial que se enviará
+    logger.info(`[${FILE_NAME}] getRecentHistory() - Historial preparado (${history.length} mensajes):`);
+    history.forEach((msg, idx) => {
+      const preview = msg.content.substring(0, 50).replace(/\n/g, ' ');
+      logger.info(`[${FILE_NAME}]   [${idx}] ${msg.role}: "${preview}${msg.content.length > 50 ? '...' : ''}" (${msg.content.length} chars)`);
+    });
+
+    return history;
   }
 
+  /**
+   * Sanitiza una acción para corregir problemas comunes
+   */
   sanitizeAction(action) {
     if (!action || !action.type) {
-      return { type: 'none' };
+      return {
+        type: 'none',
+        productId: null,
+        quantity: null,
+        url: null,
+        price_sale: null,
+        title: null,
+        price_regular: null,
+        image: null,
+        slug: null,
+      };
     }
+
     return {
-      type: action.type,
+      type: action.type || 'none',
       productId: action.productId || null,
       quantity: action.quantity || null,
       url: action.url || null,
@@ -423,64 +551,543 @@ class ChatOrchestratorService {
     };
   }
 
+  /**
+   * Cierra una conversación
+   */
   async closeConversation(conversationId) {
     const Conversation = getConversationModel();
-    await Conversation.findByIdAndUpdate(conversationId, { status: 'closed' });
+    await Conversation.findByIdAndUpdate(conversationId, {
+      status: 'closed',
+    });
     logger.info(`[Orchestrator] Closed conversation ${conversationId}`);
   }
 
+  /**
+   * Detecta el idioma del mensaje (detección simple)
+   */
   detectLanguage(message) {
-    const spanishWords = ['qué', 'cómo', 'cuándo', 'dónde', 'por qué'];
+    // Detección simple basada en palabras comunes
+    const spanishWords = ['qué', 'cómo', 'cuándo', 'dónde', 'por qué', 'tiene', 'tengo', 'quiero', 'necesito'];
+    const englishWords = ['what', 'how', 'when', 'where', 'why', 'have', 'need', 'want'];
+    const portugueseWords = ['o que', 'como', 'quando', 'onde', 'por que', 'tem', 'preciso', 'quero'];
+
     const lowerMessage = message.toLowerCase();
-    if (spanishWords.some(word => lowerMessage.includes(word))) {
-      return 'es';
-    }
-    return 'en';
+
+    const spanishCount = spanishWords.filter(word => lowerMessage.includes(word)).length;
+    const englishCount = englishWords.filter(word => lowerMessage.includes(word)).length;
+    const portugueseCount = portugueseWords.filter(word => lowerMessage.includes(word)).length;
+
+    if (spanishCount > englishCount && spanishCount > portugueseCount) return 'es';
+    if (portugueseCount > englishCount && portugueseCount > spanishCount) return 'pt';
+    if (englishCount > spanishCount && englishCount > portugueseCount) return 'en';
+
+    // Default a español
+    return 'es';
   }
 
+  /**
+   * Actualiza el contexto persistente del producto en la conversación
+   */
   updateProductContext(conversation, productData) {
+    const FILE_NAME = 'chat-orchestrator.service.js';
+
     if (!conversation || !productData) return;
-    conversation.metadata.lastProductContext = {
-      productId: productData.productId || productData.id || null,
-      slug: productData.slug || null,
-      title: productData.title || null,
-      updatedAt: new Date(),
-    };
+
+    try {
+      conversation.metadata.lastProductContext = {
+        productId: productData.productId || productData.id || null,
+        slug: productData.slug || null,
+        title: productData.title || null,
+        price: {
+          regular: productData.price?.regular || (typeof productData.price === 'object' && productData.price !== null ? productData.price.regular : null) || null,
+          sale: productData.price?.sale || (typeof productData.price === 'object' && productData.price !== null ? productData.price.sale : null) || null,
+        },
+        image: productData.image || (productData.images && productData.images[0]) || null,
+        category: productData.category || null,
+        tags: productData.tags || [],
+        description: productData.description || productData.description_short || productData.description_long || null,
+        updatedAt: new Date(),
+      };
+
+      logger.info(`[${FILE_NAME}] ✅ Contexto de producto actualizado: ${conversation.metadata.lastProductContext.title} (${conversation.metadata.lastProductContext.productId})`);
+    } catch (error) {
+      logger.error(`[${FILE_NAME}] ❌ Error actualizando contexto de producto: ${error.message}`);
+    }
   }
 
+  /**
+   * Actualiza el contexto persistente del producto desde una acción validada
+   */
+  updateProductContextFromAction(conversation, action) {
+    const FILE_NAME = 'chat-orchestrator.service.js';
+
+    if (!conversation || !action || !action.productId) return;
+
+    try {
+      conversation.metadata.lastProductContext = {
+        productId: action.productId,
+        slug: action.slug || null,
+        title: action.title || null,
+        price: {
+          regular: action.price_regular || null,
+          sale: action.price_sale || null,
+        },
+        image: action.image || null,
+        category: null,
+        tags: [],
+        description: null,
+        updatedAt: new Date(),
+      };
+
+      logger.info(`[${FILE_NAME}] ✅ Contexto de producto actualizado desde acción: ${conversation.metadata.lastProductContext.title} (${conversation.metadata.lastProductContext.productId})`);
+    } catch (error) {
+      logger.error(`[${FILE_NAME}] ❌ Error actualizando contexto de producto desde acción: ${error.message}`);
+    }
+  }
+
+  /**
+   * Busca un producto por nombre en el mensaje del usuario
+   * Versión rápida para búsquedas en tiempo real
+   */
   async findProductByNameInMessage(message, domain) {
-    // Simplified stub
+    const FILE_NAME = 'chat-orchestrator.service.js';
+
+    if (!message || !domain || message.length < 3) return null;
+
+    try {
+      // Limpiar el mensaje y buscar palabras clave de productos
+      const cleanMessage = message.trim();
+
+      // Si el mensaje es muy corto (solo confirmación), no buscar
+      if (cleanMessage.length < 5) return null;
+
+      // Buscar patrones de nombres de productos (palabras en mayúsculas o títulos)
+      const productPatterns = [
+        // Títulos completos con mayúsculas: "SILPAT DE SILICONA"
+        /([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s]+(?:[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s]*)+)/g,
+        // Palabras clave comunes seguidas de descripción
+        /(silpat|batidor|cortador|rodillo|molde|espátula|termómetro|balanza)[\s]+(?:de\s+)?([a-záéíóúñ\s]+)/gi,
+      ];
+
+      let searchTerms = [];
+      for (const pattern of productPatterns) {
+        const matches = message.match(pattern);
+        if (matches) {
+          searchTerms.push(...matches.map(m => m.trim()));
+        }
+      }
+
+      // Si no hay patrones, usar el mensaje completo (sin palabras comunes)
+      if (searchTerms.length === 0) {
+        const words = cleanMessage.split(/\s+/).filter(w =>
+          w.length > 3 &&
+          !['quiero', 'comprar', 'busco', 'necesito', 'deseo', 'agregar', 'añadir', 'carrito'].includes(w.toLowerCase())
+        );
+        if (words.length > 0) {
+          searchTerms.push(words.join(' '));
+        }
+      }
+
+      if (searchTerms.length === 0) return null;
+
+      // Ordenar por longitud (el más largo primero)
+      searchTerms = searchTerms.sort((a, b) => b.length - a.length);
+
+      logger.info(`[${FILE_NAME}] findProductByNameInMessage() - Términos de búsqueda: ${searchTerms.slice(0, 3).join(', ')}`);
+
+      const Product = getProductModel();
+
+      // Buscar cada término
+      for (const term of searchTerms.slice(0, 3)) { // Máximo 3 intentos
+        if (term.length < 3) continue;
+
+        // Crear regex flexible para la búsqueda
+        const searchRegex = new RegExp(term.replace(/\s+/g, '\\s+'), 'i');
+
+        const product = await Product.findOne({
+          domain,
+          $or: [
+            { title: searchRegex },
+            { 'category.slug': searchRegex },
+            { tags: searchRegex },
+          ],
+          is_available: true,
+        })
+        .select('title slug price image_default category tags description_short description_long')
+        .lean();
+
+        if (product) {
+          logger.info(`[${FILE_NAME}] ✅ Producto encontrado por nombre: ${product.title} (${product._id})`);
+          return {
+            id: product._id.toString(),
+            productId: product._id.toString(),
+            title: product.title,
+            slug: product.slug,
+            price: product.price,
+            images: product.image_default || [],
+            category: product.category,
+            tags: product.tags || [],
+            description: product.description_short || product.description_long,
+          };
+        }
+      }
+    } catch (error) {
+      logger.error(`[${FILE_NAME}] ❌ Error buscando producto por nombre: ${error.message}`);
+    }
+
     return null;
   }
 
+  /**
+   * Extrae información del producto desde el mensaje del asistente
+   * Busca títulos de productos mencionados en el mensaje
+   */
   async extractProductFromMessage(message, domain) {
-    // Simplified stub
+    const FILE_NAME = 'chat-orchestrator.service.js';
+
+    if (!message || !domain) return null;
+
+    try {
+      logger.info(`[${FILE_NAME}] extractProductFromMessage() - Mensaje: "${message.substring(0, 100)}"`);
+
+      // Buscar patrones comunes de productos en el mensaje
+      // Ejemplo: "Batidor GLOBO DE ACERO N° 22" o "Batidor GLOBO DE ACERO N° 22 añadido"
+      // Mejorar el patrón para capturar títulos con números y caracteres especiales
+      const productTitlePatterns = [
+        // Patrón 1: Palabras que empiezan con mayúscula seguidas de más palabras y números
+        /([A-ZÁÉÍÓÚÑ][A-Za-záéíóúñÁÉÍÓÚÑ\s]+(?:[A-ZÁÉÍÓÚÑ][A-Za-záéíóúñÁÉÍÓÚÑ\s]*)*(?:\s*N[°º]\s*\d+)?)/g,
+        // Patrón 2: Títulos que contienen palabras comunes de productos
+        /(Batidor|Cortador|Rodillo|Molde|Espátula|Termómetro|Balanza)[A-Za-záéíóúñÁÉÍÓÚÑ\s]+(?:[A-ZÁÉÍÓÚÑ][A-Za-záéíóúñÁÉÍÓÚÑ\s]*)*(?:\s*N[°º]?\s*\d+)?/gi,
+      ];
+
+      // Buscar títulos de productos mencionados
+      let potentialTitles = [];
+      for (const pattern of productTitlePatterns) {
+        const matches = message.match(pattern);
+        if (matches && matches.length > 0) {
+          potentialTitles.push(...matches);
+        }
+      }
+
+      if (potentialTitles.length > 0) {
+        // Limpiar y ordenar por longitud (el más largo es probablemente el título completo)
+        potentialTitles = potentialTitles
+          .map(t => t.trim())
+          .filter(t => t.length > 5)
+          .sort((a, b) => b.length - a.length);
+
+        logger.info(`[${FILE_NAME}] extractProductFromMessage() - Títulos potenciales encontrados: ${potentialTitles.length}`);
+
+        // Buscar cada título potencial en la base de datos
+        const Product = getProductModel();
+        for (const potentialTitle of potentialTitles) {
+          logger.info(`[${FILE_NAME}] extractProductFromMessage() - Intentando buscar: "${potentialTitle}"`);
+
+          // Crear regex más flexible para la búsqueda
+          // Escapar caracteres especiales pero permitir variaciones
+          const searchTitle = potentialTitle
+            .replace(/[°º]/g, '[°º]?') // N° o Nº
+            .replace(/\s+/g, '\\s+') // Espacios
+            .replace(/[Nn]\s*[°º]?\s*(\d+)/g, 'N[°º]?\\s*$1'); // N° 22
+
+          const product = await Product.findOne({
+            domain,
+            title: new RegExp(searchTitle, 'i'),
+            is_available: true,
+          }).lean();
+
+          if (product) {
+            logger.info(`[${FILE_NAME}] ✅ Producto encontrado por título: ${product.title} (${product._id})`);
+            return {
+              id: product._id.toString(),
+              productId: product._id.toString(),
+              title: product.title,
+              slug: product.slug,
+              price: product.price,
+              images: product.image_default || [],
+              category: product.category,
+              tags: product.tags || [],
+              description: product.description_short || product.description_long,
+            };
+          } else {
+            // Intentar búsqueda más flexible: buscar solo las primeras palabras
+            const words = potentialTitle.split(/\s+/).slice(0, 3); // Primeras 3 palabras
+            if (words.length >= 2) {
+              const shortTitle = words.join(' ');
+              logger.info(`[${FILE_NAME}] extractProductFromMessage() - Intentando búsqueda flexible: "${shortTitle}"`);
+
+              const productFlex = await Product.findOne({
+                domain,
+                title: new RegExp(shortTitle.replace(/\s+/g, '\\s+'), 'i'),
+                is_available: true,
+              }).lean();
+
+              if (productFlex) {
+                logger.info(`[${FILE_NAME}] ✅ Producto encontrado por búsqueda flexible: ${productFlex.title} (${productFlex._id})`);
+                return {
+                  id: productFlex._id.toString(),
+                  productId: productFlex._id.toString(),
+                  title: productFlex.title,
+                  slug: productFlex.slug,
+                  price: productFlex.price,
+                  images: productFlex.image_default || [],
+                  category: productFlex.category,
+                  tags: productFlex.tags || [],
+                  description: productFlex.description_short || productFlex.description_long,
+                };
+              }
+            }
+          }
+        }
+      }
+    } catch (error) {
+      logger.error(`[${FILE_NAME}] ❌ Error extrayendo producto del mensaje: ${error.message}`);
+      logger.error(`[${FILE_NAME}] Stack: ${error.stack}`);
+    }
+
+    logger.warn(`[${FILE_NAME}] extractProductFromMessage() - No se encontró producto en el mensaje`);
     return null;
   }
 
+  /**
+   * Busca referencias a productos en el historial para entender contexto
+   * Útil cuando el usuario dice "ver más detalles" sin especificar producto
+   * AHORA TAMBIÉN busca en el contexto persistente de la conversación
+   */
   findProductInHistory(history, conversation = null) {
-    if (conversation?.metadata?.lastProductContext?.productId) {
+    const FILE_NAME = 'chat-orchestrator.service.js';
+
+    // PRIORIDAD 1: Buscar en el contexto persistente de la conversación (más confiable)
+    if (conversation && conversation.metadata && conversation.metadata.lastProductContext && conversation.metadata.lastProductContext.productId) {
+      const productContext = conversation.metadata.lastProductContext;
+      logger.info(`[${FILE_NAME}] findProductInHistory() - ✅ Product encontrado en contexto persistente: ${productContext.title} (${productContext.productId})`);
       return {
-        productId: conversation.metadata.lastProductContext.productId,
-        fullData: conversation.metadata.lastProductContext,
+        productId: productContext.productId,
+        foundIn: 'conversation_context',
+        context: `Contexto persistente: ${productContext.title}`,
+        fullData: productContext, // Incluir datos completos
       };
     }
-    // Simplified stub
+
+    // Buscar en los últimos mensajes del historial
+    const messagesToCheck = history.slice(-6).reverse(); // Últimos 6 mensajes, más recientes primero
+
+    logger.info(`[${FILE_NAME}] findProductInHistory() - Buscando productos en ${messagesToCheck.length} mensajes recientes`);
+
+    for (const msg of messagesToCheck) {
+      // 1. PRIORIDAD: Buscar en metadata.lastProductShown (mejor fuente - producto más reciente mostrado)
+      if (msg.metadata && msg.metadata.lastProductShown) {
+        const product = msg.metadata.lastProductShown;
+        logger.info(`[${FILE_NAME}] findProductInHistory() - ✅ Product encontrado en lastProductShown: ${product.productId} (${product.title})`);
+        return {
+          productId: product.productId,
+          foundIn: msg.role,
+          context: `Metadata lastProductShown: ${product.title}`,
+        };
+      }
+
+      // 2. Buscar en metadata.action si existe
+      if (msg.metadata && msg.metadata.action) {
+        const action = msg.metadata.action;
+        if (action.productId) {
+          logger.info(`[${FILE_NAME}] findProductInHistory() - ✅ Product ID encontrado en metadata.action: ${action.productId}`);
+          return {
+            productId: action.productId,
+            foundIn: msg.role,
+            context: `Metadata action: ${action.title || action.slug || 'producto'}`,
+          };
+        }
+        if (action.slug) {
+          logger.info(`[${FILE_NAME}] findProductInHistory() - ✅ Product slug encontrado en metadata.action: ${action.slug}`);
+          return {
+            productId: action.slug,
+            foundIn: msg.role,
+            context: `Metadata action: ${action.title || action.slug}`,
+          };
+        }
+      }
+
+      // 3. Buscar en el contenido del mensaje si existe
+      if (!msg.content) continue;
+
+      // Buscar IDs de productos (MongoDB ObjectId) en el contenido
+      const objectIdMatch = msg.content.match(/\b[0-9a-fA-F]{24}\b/);
+      if (objectIdMatch) {
+        logger.info(`[${FILE_NAME}] findProductInHistory() - ✅ Product ID encontrado en contenido: ${objectIdMatch[0]}`);
+        return {
+          productId: objectIdMatch[0],
+          foundIn: msg.role,
+          context: msg.content.substring(0, 100),
+        };
+      }
+
+      // Buscar en el contenido agregado por getRecentHistory (PRODUCTO_MENCIONADO)
+      const productoMencionadoMatch = msg.content.match(/\[PRODUCTO_MENCIONADO:.*?ID=([a-zA-Z0-9\-_]+)/);
+      if (productoMencionadoMatch) {
+        logger.info(`[${FILE_NAME}] findProductInHistory() - ✅ Product ID encontrado en PRODUCTO_MENCIONADO: ${productoMencionadoMatch[1]}`);
+        return {
+          productId: productoMencionadoMatch[1],
+          foundIn: msg.role,
+          context: msg.content.substring(0, 100),
+        };
+      }
+
+      // Buscar slugs de productos (formato común: /product/xxx o slug: xxx)
+      // Excluir palabras comunes del español que podrían ser capturadas incorrectamente
+      const commonWords = ['del', 'de', 'la', 'el', 'los', 'las', 'un', 'una', 'uno', 'dos', 'tres', 'con', 'por', 'para', 'ver', 'mas', 'más', 'detalles', 'detalle'];
+
+      const slugPatterns = [
+        /(?:slug|ID|productId)[:\s]+([a-zA-Z0-9\-_]{3,})/i, // Mínimo 3 caracteres
+        /\/product\/([a-zA-Z0-9\-_]{3,})/i, // Mínimo 3 caracteres
+        /productId["\s:]+["']?([a-zA-Z0-9\-_]{3,})["']?/i, // Mínimo 3 caracteres
+      ];
+
+      for (const pattern of slugPatterns) {
+        const slugMatch = msg.content.match(pattern);
+        if (slugMatch && slugMatch[1]) {
+          const foundSlug = slugMatch[1].toLowerCase();
+          // Validar que no sea una palabra común
+          if (!commonWords.includes(foundSlug) && foundSlug.length >= 3) {
+            logger.info(`[${FILE_NAME}] findProductInHistory() - ✅ Product identificador encontrado: ${slugMatch[1]}`);
+            return {
+              productId: slugMatch[1],
+              foundIn: msg.role,
+              context: msg.content.substring(0, 100),
+            };
+          } else {
+            logger.debug(`[${FILE_NAME}] findProductInHistory() - ⚠️ Ignorando palabra común: ${foundSlug}`);
+          }
+        }
+      }
+    }
+
+    logger.info(`[${FILE_NAME}] findProductInHistory() - ❌ No se encontró producto en el historial`);
     return null;
   }
 
+  /**
+   * Construye un prompt dinámico basado en la intención y resultado del tool
+   */
   buildDynamicPrompt(intent, toolResult, baseSystemPrompt, domain) {
     const shortPrompt = PromptMemoryService.buildShortSystemPrompt(domain);
+
     let contextualInfo = '';
-    if (intent === 'search_products' && toolResult.data?.products?.length > 0) {
-        contextualInfo = `\n\nINFORMACIÓN RELEVANTE:\n` + toolResult.data.products.map(p => p.title).join(', ');
+
+    switch (intent) {
+      case 'search_products':
+        if (toolResult.data && toolResult.data.products && toolResult.data.products.length > 0) {
+          const products = toolResult.data.products.slice(0, 5); // Limitar a 5 productos
+          contextualInfo = `\n\nINFORMACIÓN RELEVANTE - Productos encontrados (${toolResult.data.count} total):\n`;
+          contextualInfo += products.map((p, i) =>
+            `${i + 1}. ${p.title} - S/${p.price.regular}${p.price.sale !== p.price.regular ? ` (Oferta: S/${p.price.sale})` : ''} - ID: ${p.id} - Slug: ${p.slug}`
+          ).join('\n');
+          contextualInfo += '\n\nINSTRUCCIONES: Presenta estos productos de forma amable. Si el usuario pregunta por un producto específico, usa el ID o slug para acciones.';
+        } else {
+          contextualInfo = '\n\nINFORMACIÓN: No se encontraron productos. Informa amablemente al usuario y pregunta si busca algo específico.';
+        }
+        break;
+
+      case 'company_info':
+        if (toolResult.data) {
+          contextualInfo = `\n\nINFORMACIÓN DE LA EMPRESA:\n`;
+          if (toolResult.data.name) contextualInfo += `Nombre: ${toolResult.data.name}\n`;
+          if (toolResult.data.description) contextualInfo += `Descripción: ${toolResult.data.description}\n`;
+          if (toolResult.data.address) contextualInfo += `Dirección: ${toolResult.data.address}\n`;
+          if (toolResult.data.phone) contextualInfo += `Teléfono: ${toolResult.data.phone}\n`;
+          if (toolResult.data.email) contextualInfo += `Email: ${toolResult.data.email}\n`;
+          contextualInfo += '\n\nINSTRUCCIONES: Responde con esta información de forma natural y amable.';
+        }
+        break;
+
+      case 'product_price':
+        if (toolResult.data) {
+          contextualInfo = `\n\nINFORMACIÓN DEL PRODUCTO:\n`;
+          contextualInfo += `Nombre: ${toolResult.data.title}\n`;
+          contextualInfo += `Precio regular: S/${toolResult.data.price.regular}\n`;
+          if (toolResult.data.price.sale !== toolResult.data.price.regular) {
+            contextualInfo += `Precio de oferta: S/${toolResult.data.price.sale}\n`;
+          }
+          contextualInfo += `ID: ${toolResult.data.productId}\n`;
+          contextualInfo += '\n\nINSTRUCCIONES: Informa el precio de forma clara y amable.';
+        }
+        break;
+
+      case 'product_details':
+        if (toolResult.data) {
+          contextualInfo = `\n\nINFORMACIÓN DEL PRODUCTO:\n`;
+          contextualInfo += `Nombre: ${toolResult.data.title}\n`;
+          contextualInfo += `Descripción: ${toolResult.data.description}\n`;
+          if (toolResult.data.price) {
+            contextualInfo += `Precio: S/${toolResult.data.price.regular || toolResult.data.price}\n`;
+          }
+          contextualInfo += `ID: ${toolResult.data.id}\n`;
+          contextualInfo += `Slug: ${toolResult.data.slug}\n`;
+          contextualInfo += '\n\nINSTRUCCIONES: Presenta los detalles del producto de forma clara y atractiva.';
+        }
+        break;
+
+      case 'shipping_info':
+        if (toolResult.data) {
+          contextualInfo = `\n\nINFORMACIÓN DE ENVÍO:\n`;
+          if (toolResult.data.shippingPolicy) contextualInfo += `Política: ${toolResult.data.shippingPolicy}\n`;
+          if (toolResult.data.freeShippingThreshold) {
+            contextualInfo += `Envío gratis a partir de: S/${toolResult.data.freeShippingThreshold}\n`;
+          }
+          contextualInfo += '\n\nINSTRUCCIONES: Explica la información de envío de forma clara.';
+        }
+        break;
+
+      case 'add_to_cart':
+        if (toolResult.data) {
+          contextualInfo = `\n\nPRODUCTO PARA AGREGAR AL CARRITO:\n`;
+          contextualInfo += `ID: ${toolResult.data.productId}\n`;
+          contextualInfo += `Nombre: ${toolResult.data.title}\n`;
+          contextualInfo += `Precio: S/${toolResult.data.price.regular || toolResult.data.price}\n`;
+          if (toolResult.data.price.sale && toolResult.data.price.sale !== toolResult.data.price.regular) {
+            contextualInfo += `Precio oferta: S/${toolResult.data.price.sale}\n`;
+          }
+          contextualInfo += `Cantidad: ${toolResult.data.quantity || 1}\n`;
+          contextualInfo += `Slug: ${toolResult.data.slug}\n`;
+          if (toolResult.data.image) {
+            contextualInfo += `Imagen: ${toolResult.data.image}\n`;
+          }
+          contextualInfo += '\n\nINSTRUCCIONES: Ejecuta la acción add_to_cart con estos datos. Responde confirmando que se agregó al carrito.';
+        }
+        break;
     }
+
+    // Construir prompt dinámico: instrucciones base + información contextual
     return `${shortPrompt}${contextualInfo}`;
   }
 
+  /**
+   * Obtiene estadísticas de uso
+   */
   async getUsageStats(domain, startDate, endDate) {
-    // Simplified stub
-    return [];
+    const TokenUsage = getTokenUsageModel();
+    const stats = await TokenUsage.aggregate([
+      {
+        $match: {
+          domain,
+          timestamp: {
+            $gte: startDate,
+            $lte: endDate,
+          },
+        },
+      },
+      {
+        $group: {
+          _id: '$provider',
+          totalTokens: { $sum: '$tokens.total' },
+          totalCachedTokens: { $sum: '$tokens.cached' },
+          totalCost: { $sum: '$cost.total' },
+          count: { $sum: 1 },
+          avgResponseTime: { $avg: '$metadata.responseTime' },
+        },
+      },
+    ]);
+
+    return stats;
   }
 }
 

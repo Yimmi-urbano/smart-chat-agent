@@ -288,7 +288,11 @@ class OpenAIAgentService {
   async generateResponseStream(userMessage, conversationHistory, domain, systemPrompt) {
     try {
       const { requestOptions } = this._prepareApiRequest(userMessage, conversationHistory, domain, systemPrompt);
-      const stream = await this.client.chat.completions.create({ ...requestOptions, stream: true });
+      const stream = await this.client.chat.completions.create({
+        ...requestOptions,
+        stream: true,
+        stream_options: { include_usage: true },
+      });
       return stream;
     } catch (error) {
       logger.error('[OpenAI] Error generating stream response:', error);

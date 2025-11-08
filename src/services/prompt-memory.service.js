@@ -76,8 +76,6 @@ class PromptMemoryService {
     try {
       const Product = getProductModel();
       
-      // OPTIMIZACIÓN: Solo obtener categorías únicas y algunos productos destacados
-      // Esto reduce drásticamente el consumo de tokens
       const [totalProducts, categories, featuredProducts] = await Promise.all([
         Product.countDocuments({ domain, is_available: true }),
         Product.distinct('category.slug', { domain, is_available: true }),
@@ -86,13 +84,12 @@ class PromptMemoryService {
           is_available: true,
         })
         .select('title price slug _id category')
-        .limit(5) // Solo 5 productos destacados como ejemplo
+        .limit(5)
         .lean(),
       ]);
 
       logger.info(`[PromptMemory] ✅ Loaded catalog summary: ${totalProducts} total products, ${categories.length} categories`);
 
-      // Crear resumen compacto
       const categoriesText = categories.length > 0 
         ? `Categorías disponibles: ${categories.slice(0, 10).join(', ')}${categories.length > 10 ? ' y más...' : ''}`
         : 'No hay categorías disponibles.';
@@ -108,7 +105,7 @@ class PromptMemoryService {
       const catalogData = {
         text: catalogSummary,
         count: totalProducts,
-        categories: categories.slice(0, 20), // Guardar hasta 20 categorías para referencia
+        categories: categories.slice(0, 20),
         featuredProducts: featuredProducts.map(p => ({
           id: p._id.toString(),
           title: p.title,
@@ -117,16 +114,17 @@ class PromptMemoryService {
         })),
       };
 
-      // Guardar en caché
-      productCatalogCache.set(domain, {
-        data: catalogData,
-        timestamp: Date.now(),
-      });
-
+      productCatalogCache.set(domain, { data: catalogData, timestamp: Date.now() });
       return catalogData;
+
     } catch (error) {
-      logger.error(`[PromptMemory] CRITICAL: Failed to load product catalog for domain ${domain}. This is a fatal error.`, { errorMessage: error.message, stack: error.stack });
-      throw new Error(`Failed to load product catalog for domain ${domain}.`);
+      logger.error(`[PromptMemory] Error loading product catalog for ${domain}. Returning safe default.`, { message: error.message });
+      return {
+        text: 'No se pudo cargar el catálogo de productos. Usa la herramienta de búsqueda para encontrar productos.',
+        count: 0,
+        categories: [],
+        featuredProducts: [],
+      };
     }
   }
 

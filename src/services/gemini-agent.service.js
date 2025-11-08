@@ -307,19 +307,36 @@ class GeminiAgentService {
    */
   async generateResponseStream(userMessage, conversationHistory, domain, systemPrompt, useThinking = false) {
     try {
-      const messages = this._prepareMessages(userMessage, conversationHistory, domain, systemPrompt);
-      const model = this._getModel(useThinking);
+        const messages = this._prepareMessages(userMessage, conversationHistory, domain, systemPrompt);
+        const model = this._getModel(useThinking);
 
-      const chat = model.startChat({
-        history: messages.slice(0, -1),
-        tools: [{ functionDeclarations: this.tools }],
-      });
+        const chat = model.startChat({
+            history: messages.slice(0, -1),
+            tools: [{ functionDeclarations: this.tools }],
+        });
 
-      const result = await chat.sendMessageStream(messages[messages.length - 1].parts[0].text);
-      return result.stream;
+        const { totalTokens: inputTokens } = await model.countTokens({ contents: messages });
+        const result = await chat.sendMessageStream(messages[messages.length - 1].parts[0].text);
+
+        const usagePromise = result.response.then(response => {
+            const usageMetadata = response.usageMetadata || {};
+            const outputTokens = usageMetadata.candidatesTokenCount || 0;
+            const tokenData = {
+                input: inputTokens || usageMetadata.promptTokenCount || 0,
+                output: outputTokens,
+                total: (inputTokens || 0) + outputTokens,
+            };
+            logger.info(`[Gemini] Stream usage resolved: In ${tokenData.input}, Out ${tokenData.output}`);
+            return tokenData;
+        }).catch(error => {
+            logger.error('[Gemini] Error resolving usage promise:', error);
+            return { input: inputTokens || 0, output: 0, total: inputTokens || 0 };
+        });
+
+        return { stream: result.stream, usagePromise };
     } catch (error) {
-      logger.error('[Gemini] Error generating stream response:', error);
-      throw error;
+        logger.error('[Gemini] Error generating stream response:', error);
+        throw error;
     }
   }
 
