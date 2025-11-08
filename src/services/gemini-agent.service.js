@@ -263,27 +263,28 @@ class GeminiAgentService {
    * 
    * MEJORA: Mantiene el system prompt en el historial (memorizado)
    */
-  async generateResponse(userMessage, conversationHistory, domain, systemPrompt, useThinking = false) {
+  async generateResponse(userMessage, conversationHistory, domain, systemPrompt, useThinking = false, stream = false) {
     try {
       // OPTIMIZACIÓN: Usar prompt corto después del primer mensaje para reducir tokens
       const PromptMemoryService = require('./prompt-memory.service');
-      let messages = [];
-      
-      if (conversationHistory.length > 0 && conversationHistory[0].role === 'system') {
+      let messages;
+      const isFirstUserMessage = conversationHistory.length === 1;
+
+      if (isFirstUserMessage) {
+        // Primera vez: usar el system prompt completo
+        messages = [
+          { role: 'user', parts: [{ text: systemPrompt }] },
+          { role: 'model', parts: [{ text: '¡Hola! ¿En qué puedo ayudarte hoy?' }] }, // Simular una respuesta inicial para establecer el contexto
+        ];
+        logger.info('[Gemini] Using full system prompt (first message)');
+      } else {
         // Ya hay conversación: usar prompt corto para ahorrar tokens
-        // El contexto ya está establecido, solo necesitamos instrucciones mínimas
         const shortPrompt = PromptMemoryService.buildShortSystemPrompt(domain);
         
-        // OPTIMIZACIÓN: Filtrar el system prompt largo del historial y usar el corto
-        // Solo enviar mensajes de conversación (sin el system prompt largo)
+        // Filtrar el system prompt largo del historial
         const conversationMessages = conversationHistory.slice(1);
         
         logger.info(`[Gemini] Preparing messages: short prompt (${shortPrompt.length} chars) + ${conversationMessages.length} history messages`);
-        logger.info(`[Gemini] History messages details:`);
-        conversationMessages.forEach((msg, idx) => {
-          const preview = msg.content.substring(0, 60).replace(/\n/g, ' ');
-          logger.info(`[Gemini]   [${idx}] ${msg.role}: "${preview}${msg.content.length > 60 ? '...' : ''}"`);
-        });
         
         messages = [
           { role: 'user', parts: [{ text: shortPrompt }] },
@@ -294,18 +295,6 @@ class GeminiAgentService {
         ];
         
         logger.info(`[Gemini] Using short system prompt + ${conversationMessages.length} history messages to reduce tokens`);
-        logger.info(`[Gemini] Total messages to send: ${messages.length} (including current user message)`);
-      } else {
-        // Primera vez: usar el system prompt completo
-        messages = [
-          { role: 'user', parts: [{ text: systemPrompt }] },
-          ...conversationHistory.map(msg => ({
-            role: msg.role === 'assistant' ? 'model' : 'user',
-            parts: [{ text: msg.content }],
-          })),
-        ];
-        
-        logger.info('[Gemini] Using full system prompt (first message)');
       }
 
       // Agregar el mensaje actual del usuario
@@ -341,6 +330,11 @@ class GeminiAgentService {
         history: messages.slice(0, -1),
         tools: [{ functionDeclarations: this.tools }],
       });
+
+      if (stream) {
+        const result = await chat.sendMessageStream(messages[messages.length - 1].parts[0].text);
+        return result.stream;
+      }
 
       const result = await chat.sendMessage(messages[messages.length - 1].parts[0].text);
       

@@ -244,30 +244,36 @@ class OpenAIAgentService {
    * Esto reduce tokens en 85-95% en mensajes subsecuentes
    * OPTIMIZACIÓN: Usa function calling para buscar productos sin enviarlos en el prompt
    */
-  async generateResponse(userMessage, conversationHistory, domain, systemPrompt) {
+  async generateResponse(userMessage, conversationHistory, domain, systemPrompt, stream = false) {
     const FILE_NAME = 'openai-agent.service.js';
     
     try {
       // OPTIMIZACIÓN: Usar prompt corto después del primer mensaje para reducir tokens
       const PromptMemoryService = require('./prompt-memory.service');
-      let systemMessage = null;
-      let messagesForAPI = [];
+      let systemMessage;
+      let messagesForAPI;
 
-      if (conversationHistory.length > 0 && conversationHistory[0].role === 'system') {
+      // La conversación siempre tiene al menos el prompt de sistema.
+      // Si tiene más de 1 mensaje, es una conversación existente.
+      const isFirstUserMessage = conversationHistory.length === 1;
+
+      if (isFirstUserMessage) {
+        // Primera vez: usar el system prompt completo
+        systemMessage = systemPrompt;
+        messagesForAPI = [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage },
+        ];
+        logger.info(`[${FILE_NAME}] Using full system prompt (first message) (${systemPrompt.length} chars)`);
+      } else {
         // Ya hay conversación: usar prompt corto para ahorrar tokens
-        // El contexto ya está establecido, solo necesitamos instrucciones mínimas
         const shortPrompt = PromptMemoryService.buildShortSystemPrompt(domain);
         systemMessage = shortPrompt;
         
-        // Filtrar el system prompt largo del historial y usar el corto
+        // Filtrar el system prompt largo del historial
         const conversationMessages = conversationHistory.slice(1);
         
         logger.info(`[${FILE_NAME}] Preparing messages: short prompt (${shortPrompt.length} chars) + ${conversationMessages.length} history messages`);
-        logger.info(`[${FILE_NAME}] History messages details:`);
-        conversationMessages.forEach((msg, idx) => {
-          const preview = msg.content.substring(0, 60).replace(/\n/g, ' ');
-          logger.info(`[${FILE_NAME}]   [${idx}] ${msg.role}: "${preview}${msg.content.length > 60 ? '...' : ''}"`);
-        });
         
         messagesForAPI = [
           { role: 'system', content: shortPrompt },
@@ -276,17 +282,6 @@ class OpenAIAgentService {
         ];
         
         logger.info(`[${FILE_NAME}] Using short system prompt to reduce tokens (${shortPrompt.length} chars)`);
-        logger.info(`[${FILE_NAME}] Total messages to send: ${messagesForAPI.length}`);
-      } else {
-        // Primera vez: usar el system prompt completo
-        systemMessage = systemPrompt;
-        messagesForAPI = [
-          { role: 'system', content: systemPrompt },
-          ...conversationHistory,
-          { role: 'user', content: userMessage },
-        ];
-        
-        logger.info(`[${FILE_NAME}] Using full system prompt (first message) (${systemPrompt.length} chars)`);
       }
 
       // Generar hash del system prompt para cache
@@ -300,6 +295,7 @@ class OpenAIAgentService {
         max_tokens: config.openai.maxTokens,
         tools: this.tools,
         tool_choice: 'auto', // Permite que el modelo decida cuándo usar las funciones
+        stream,
       };
 
       // MEJORA: Agregar prompt caching si está habilitado
@@ -307,7 +303,12 @@ class OpenAIAgentService {
         logger.info(`[OpenAI] Prompt caching enabled (system prompt hash: ${systemPromptHash.substring(0, 8)}...)`);
       }
 
-      let completion = await this.client.chat.completions.create(requestOptions);
+      const completion = await this.client.chat.completions.create(requestOptions);
+
+      if (stream) {
+        return completion;
+      }
+
       let message = completion.choices[0].message;
       let functionResults = [];
 
@@ -337,11 +338,12 @@ class OpenAIAgentService {
         }
 
         // Obtener respuesta final del modelo
-        completion = await this.client.chat.completions.create({
+        const newCompletion = await this.client.chat.completions.create({
           ...requestOptions,
           messages: messagesForAPI,
+          stream: false, // El segundo paso no puede ser stream
         });
-        message = completion.choices[0].message;
+        message = newCompletion.choices[0].message;
       }
 
       // Parsear respuesta final
