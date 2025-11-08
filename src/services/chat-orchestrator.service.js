@@ -1328,83 +1328,358 @@ class ChatOrchestratorService {
 
     return stats;
   }
-}
 
-  async processMessageStream({ userMessage, userId, domain, forceModel, res }) {
+  /**
+   * Obtiene o construye el system prompt (función auxiliar reutilizable)
+   */
+  async getSystemPrompt(conversation, domain) {
+    const FILE_NAME = 'chat-orchestrator.service.js';
+    
+    // Verificar si ya hay un system prompt en el historial (memorizado)
+    const hasSystemPrompt = conversation.messages && 
+                            conversation.messages.length > 0 && 
+                            conversation.messages[0].role === 'system';
+    
+    if (hasSystemPrompt) {
+      // Usar el system prompt memorizado
+      let systemPrompt = conversation.messages[0].content;
+      const systemPromptHash = conversation.systemPromptHash || 
+                            crypto.createHash('md5').update(systemPrompt).digest('hex');
+      
+      // OPTIMIZACIÓN: Si el system prompt es muy grande (>5000 caracteres), es una versión antigua
+      if (systemPrompt.length > 5000) {
+        logger.warn(`[${FILE_NAME}] ⚠️ System prompt antiguo (${systemPrompt.length} chars), regenerando...`);
+        systemPrompt = await PromptMemoryService.buildSystemPrompt(domain);
+        const newHash = crypto.createHash('md5').update(systemPrompt).digest('hex');
+        conversation.messages[0].content = systemPrompt;
+        conversation.systemPromptHash = newHash;
+        await conversation.save();
+        logger.info(`[${FILE_NAME}] ✅ System prompt regenerado (${systemPrompt.length} chars)`);
+      }
+      
+      return systemPrompt;
+    } else {
+      // Primera vez: construir y memorizar el system prompt
+      logger.info(`[${FILE_NAME}] Construyendo nuevo system prompt...`);
+      const systemPrompt = await PromptMemoryService.buildSystemPrompt(domain);
+      const systemPromptHash = crypto.createHash('md5').update(systemPrompt).digest('hex');
+      
+      if (!conversation.messages) conversation.messages = [];
+      conversation.messages.unshift({ role: 'system', content: systemPrompt, timestamp: new Date() });
+      conversation.systemPromptHash = systemPromptHash;
+      await conversation.save();
+      
+      const Conversation = getConversationModel();
+      const updatedConversation = await Conversation.findById(conversation._id);
+      logger.info(`[${FILE_NAME}] ✅ System prompt guardado (${systemPrompt.length} chars)`);
+      
+      return systemPrompt;
+    }
+  }
+
+  /**
+   * Guarda la conversación después del streaming (función auxiliar)
+   */
+  async saveConversation(conversation, userMessage, response, usedModel, fullResponseMessage, startTime, toolResult = null, interpretedIntent = null, systemPrompt = null, dynamicPrompt = null) {
+    const FILE_NAME = 'chat-orchestrator.service.js';
+    
+    try {
+      // Calcular tokens (si están disponibles en response)
+      const tokenData = {
+        input: response.usage?.input || response.usageMetadata?.promptTokenCount || 0,
+        output: response.usage?.output || response.usageMetadata?.candidatesTokenCount || 0,
+        thinking: response.usage?.thinking || response.usageMetadata?.thinkingTokenCount || 0,
+        cached: response.usage?.cached || 0,
+        total: response.usage?.total || 0,
+      };
+
+      if (tokenData.total === 0) {
+        tokenData.total = tokenData.input + tokenData.output + tokenData.thinking;
+      }
+
+      const cost = getTokenUsageModel.calculateCost(
+        usedModel === 'gemini' ? 'gemini' : 'openai',
+        usedModel === 'gemini' ? config.gemini.model : config.openai.model,
+        tokenData
+      );
+
+      // Guardar mensaje del usuario
+      conversation.messages.push({
+        role: 'user',
+        content: userMessage,
+        timestamp: new Date(),
+      });
+
+      // Preparar metadata del asistente
+      const finalSystemPrompt = dynamicPrompt || systemPrompt || '';
+      let promptType = 'system';
+      let promptFull = finalSystemPrompt;
+
+      if (dynamicPrompt) {
+        promptType = 'system+dynamic';
+      } else if (systemPrompt) {
+        const shortPrompt = PromptMemoryService.buildShortSystemPrompt(conversation.domain || '');
+        const shortPromptLength = shortPrompt.length;
+        if (systemPrompt.length <= shortPromptLength * 1.5 && systemPrompt.length >= shortPromptLength * 0.8) {
+          promptType = 'short';
+        } else {
+          promptType = 'system';
+        }
+      }
+
+      const promptHashForAudit = systemPrompt ? crypto.createHash('md5').update(systemPrompt).digest('hex').substring(0, 8) : null;
+
+      const assistantMetadata = {
+        model: usedModel,
+        tokens: tokenData,
+        thinkingUsed: false, // En streaming no se usa thinking mode normalmente
+        cachedTokens: tokenData.cached,
+        action: response.action || { type: 'none', productId: null, quantity: null, url: null, price_sale: null, title: null, price_regular: null, image: null, slug: null },
+        prompt: promptFull,
+        promptType: promptType,
+        promptLength: promptFull.length,
+        systemPromptHash: promptHashForAudit,
+      };
+
+      // Guardar información del producto si existe
+      if (toolResult && toolResult.data) {
+        if (toolResult.data.products && toolResult.data.products.length > 0) {
+          const firstProduct = toolResult.data.products[0];
+          assistantMetadata.lastProductShown = {
+            productId: firstProduct.id,
+            slug: firstProduct.slug,
+            title: firstProduct.title,
+          };
+        } else if (toolResult.data.productId || toolResult.data.id) {
+          assistantMetadata.lastProductShown = {
+            productId: toolResult.data.productId || toolResult.data.id,
+            slug: toolResult.data.slug,
+            title: toolResult.data.title,
+          };
+        }
+      }
+
+      // Guardar mensaje del asistente
+      conversation.messages.push({
+        role: 'assistant',
+        content: fullResponseMessage,
+        timestamp: new Date(),
+        metadata: assistantMetadata,
+      });
+
+      // Actualizar metadata de conversación
+      conversation.metadata.totalMessages += 2;
+      conversation.metadata.totalTokens += tokenData.total;
+      conversation.metadata.cachedTokens += tokenData.cached;
+      conversation.metadata.modelsUsed[usedModel] = (conversation.metadata.modelsUsed[usedModel] || 0) + 1;
+
+      const responseTime = Date.now() - startTime;
+      conversation.metadata.averageResponseTime = 
+        (conversation.metadata.averageResponseTime + responseTime) / 2;
+
+      await conversation.save();
+
+      // Guardar métricas de tokens
+      const TokenUsage = getTokenUsageModel();
+      await TokenUsage.create({
+        domain: conversation.domain,
+        userId: conversation.userId,
+        conversationId: conversation._id,
+        provider: usedModel === 'gemini' ? 'gemini' : 'openai',
+        model: usedModel === 'gemini' ? config.gemini.model : config.openai.model,
+        tokens: tokenData,
+        cost,
+        metadata: {
+          endpoint: '/api/chat/message/stream',
+          responseTime,
+          cacheHit: tokenData.cached > 0,
+          fallbackUsed: false,
+          errorOccurred: false,
+        },
+      });
+
+      logger.info(`[${FILE_NAME}] ✅ Conversación guardada post-stream.`);
+    } catch (error) {
+      logger.error(`[${FILE_NAME}] ❌ Error guardando conversación post-stream: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Procesa un mensaje con streaming (SSE)
+   */
+  async processMessageStream({ userMessage, userId, domain, forceModel = null, res }) {
     const startTime = Date.now();
     const FILE_NAME = 'chat-orchestrator.service.js';
-    // Lógica principal de processMessage pero adaptada para streaming
-    // PASO 1: PREPARACIÓN
-    let conversation = await this.getOrCreateConversation(userId, domain);
-    let systemPrompt = await this.getSystemPrompt(conversation, domain);
-    const history = this.getRecentHistory(conversation);
+    
+    logger.info(`[${FILE_NAME}] ========================================`);
+    logger.info(`[${FILE_NAME}] 🔄 INICIANDO PROCESAMIENTO DE MENSAJE (STREAMING)`);
+    logger.info(`[${FILE_NAME}] Usuario: ${userId} | Dominio: ${domain}`);
+    logger.info(`[${FILE_NAME}] Mensaje: "${userMessage.substring(0, 100)}${userMessage.length > 100 ? '...' : ''}"`);
+    logger.info(`[${FILE_NAME}] ========================================`);
+    
+    try {
+      // PASO 1: PREPARACIÓN
+      let conversation = await this.getOrCreateConversation(userId, domain);
+      logger.info(`[${FILE_NAME}] [STREAM] [PASO 1/4] ✅ Conversación: ${conversation._id}`);
+      
+      const systemPrompt = await this.getSystemPrompt(conversation, domain);
+      const history = this.getRecentHistory(conversation);
+      logger.info(`[${FILE_NAME}] [STREAM] [PASO 1/4] ✅ Historial obtenido: ${history.length} mensajes`);
 
-    // PASO 2: INTERPRETACIÓN Y TOOLS (simplificado para el stream inicial)
-    // En una implementación real y compleja, podrías tener una primera llamada para decidir si usar tools
-    // y luego hacer el stream. Por simplicidad aquí, asumimos que el streaming es para respuestas directas.
+      // PASO 2: INTERPRETACIÓN Y TOOLS (simplificado para streaming)
+      let interpretedIntent = null;
+      let toolResult = null;
+      let dynamicPrompt = null;
 
-    // PASO 3: GENERACIÓN
-    const selectedModel = forceModel || ModelRouterService.decideModel(userMessage, history);
-    const finalSystemPrompt = systemPrompt; // En un caso real, podría ser dinámico
+      if (IntentInterpreterService.enabled) {
+        try {
+          const language = this.detectLanguage(userMessage);
+          interpretedIntent = await IntentInterpreterService.interpret(userMessage, language, domain);
+          logger.info(`[${FILE_NAME}] [STREAM] [PASO 2/4] ✅ Intención: ${interpretedIntent.intent}`);
 
-    let responseStream;
-    let usedModel = selectedModel;
+          if (interpretedIntent.intent !== 'general_chat' && interpretedIntent.confidence >= 0.6) {
+            // Buscar producto en historial si falta
+            const productIntentions = ['add_to_cart', 'product_details', 'product_price'];
+            if (productIntentions.includes(interpretedIntent.intent) && 
+                !interpretedIntent.params.productId && 
+                !interpretedIntent.params.query) {
+              const productInHistory = this.findProductInHistory(history, conversation);
+              if (productInHistory) {
+                interpretedIntent.params.productId = productInHistory.productId;
+              }
+            }
 
-    if (selectedModel === 'gemini') {
-      const thinkingUsed = ModelRouterService.shouldUseThinking(userMessage);
-      responseStream = await this.geminiService.generateResponse(userMessage, history, domain, finalSystemPrompt, thinkingUsed, true);
-    } else {
-      responseStream = await this.openaiService.generateResponse(userMessage, history, domain, finalSystemPrompt, true);
-    }
+            toolResult = await ToolExecutorService.executeTool(
+              interpretedIntent.intent,
+              interpretedIntent.params,
+              domain
+            );
 
-    // Procesar el stream, enviar al cliente y acumular la respuesta
-    let fullResponseMessage = '';
-    for await (const chunk of responseStream) {
-      const text = chunk.choices[0]?.delta?.content || (chunk.text && chunk.text()) || '';
-      if (text) {
-        fullResponseMessage += text;
-        res.write(`data: ${JSON.stringify({ text })}\n\n`);
+            if (toolResult) {
+              dynamicPrompt = this.buildDynamicPrompt(interpretedIntent.intent, toolResult, systemPrompt, domain);
+              logger.info(`[${FILE_NAME}] [STREAM] [PASO 2/4] ✅ Tool ejecutado: ${toolResult.tool}`);
+            }
+          }
+        } catch (error) {
+          logger.error(`[${FILE_NAME}] [STREAM] [PASO 2/4] ❌ Error en interpretación: ${error.message}`);
+        }
       }
+
+      // PASO 3: GENERACIÓN CON STREAMING
+      const selectedModel = forceModel || config.router.defaultProvider;
+      const finalSystemPrompt = dynamicPrompt || systemPrompt;
+      let usedModel = selectedModel;
+
+      logger.info(`[${FILE_NAME}] [STREAM] [PASO 3/4] Generando respuesta con modelo: ${selectedModel}`);
+
+      // Configurar headers para SSE
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+
+      let responseStream;
+      let fullResponseMessage = '';
+      let responseUsage = null;
+
+      try {
+        if (selectedModel === 'gemini') {
+          const thinkingUsed = false; // No usar thinking mode en streaming por ahora
+          responseStream = await this.geminiService.generateResponse(
+            userMessage, 
+            history, 
+            domain, 
+            finalSystemPrompt, 
+            thinkingUsed, 
+            true // streaming = true
+          );
+          usedModel = 'gemini';
+        } else {
+          responseStream = await this.openaiService.generateResponse(
+            userMessage, 
+            history, 
+            domain, 
+            finalSystemPrompt, 
+            true // streaming = true
+          );
+          usedModel = 'openai';
+        }
+
+        // Procesar el stream y enviar al cliente
+        for await (const chunk of responseStream) {
+          let text = '';
+          
+          // Formato puede variar entre Gemini y OpenAI
+          if (chunk.choices && chunk.choices[0]?.delta?.content) {
+            // Formato OpenAI
+            text = chunk.choices[0].delta.content;
+          } else if (chunk.text) {
+            // Formato Gemini
+            text = typeof chunk.text === 'function' ? chunk.text() : chunk.text;
+          } else if (typeof chunk === 'string') {
+            text = chunk;
+          }
+          
+          if (text) {
+            fullResponseMessage += text;
+            res.write(`data: ${JSON.stringify({ text })}\n\n`);
+          }
+
+          // Capturar usage si está disponible
+          if (chunk.usage) {
+            responseUsage = chunk.usage;
+          }
+        }
+
+        // Enviar evento de finalización
+        res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+        res.end();
+
+        logger.info(`[${FILE_NAME}] [STREAM] [PASO 3/4] ✅ Stream completado (${fullResponseMessage.length} caracteres)`);
+
+      } catch (error) {
+        logger.error(`[${FILE_NAME}] [STREAM] [PASO 3/4] ❌ Error en streaming: ${error.message}`);
+        res.write(`data: ${JSON.stringify({ error: 'Error generando respuesta' })}\n\n`);
+        res.end();
+        throw error;
+      }
+
+      // PASO 4: PERSISTENCIA
+      logger.info(`[${FILE_NAME}] [STREAM] [PASO 4/4] Guardando conversación...`);
+      
+      const responseForPersistence = {
+        message: fullResponseMessage,
+        audio_description: fullResponseMessage.substring(0, 150),
+        action: { type: 'none', productId: null, quantity: null, url: null, price_sale: null, title: null, price_regular: null, image: null, slug: null },
+        usage: responseUsage || {},
+      };
+
+      await this.saveConversation(
+        conversation, 
+        userMessage, 
+        responseForPersistence, 
+        usedModel, 
+        fullResponseMessage, 
+        startTime,
+        toolResult,
+        interpretedIntent,
+        systemPrompt,
+        dynamicPrompt
+      );
+
+      logger.info(`[${FILE_NAME}] [STREAM] ✅ PROCESAMIENTO COMPLETADO`);
+      
+    } catch (error) {
+      logger.error(`[${FILE_NAME}] [STREAM] ❌ ERROR CRÍTICO: ${error.message}`);
+      logger.error(`[${FILE_NAME}] [STREAM] Stack: ${error.stack}`);
+      
+      if (!res.headersSent) {
+        res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+        res.end();
+      }
+      
+      throw error;
     }
-
-    // PASO 4 y 5: VALIDACIÓN Y PERSISTENCIA (después de recibir la respuesta completa)
-    const responseForPersistence = {
-      message: fullResponseMessage,
-      // Aquí podrías parsear `fullResponseMessage` si esperas un JSON, o realizar otra llamada al LLM
-      // para generar los campos faltantes como `audio_description` y `action`.
-      // Por simplicidad, los dejaremos como están.
-      audio_description: fullResponseMessage.substring(0, 150),
-      action: { type: 'none' },
-      usage: {}, // La información de tokens no está disponible fácilmente en streams
-    };
-
-    // Ahora ejecuta la lógica de persistencia con la respuesta completa
-    await this.saveConversation(conversation, userMessage, responseForPersistence, usedModel, fullResponseMessage, startTime);
-  }
-
-  async getSystemPrompt(conversation, domain) {
-    // ... lógica para obtener o crear el system prompt ...
-    // Esta es una simplificación de la lógica que ya tienes en processMessage
-    if (conversation.messages && conversation.messages.length > 0 && conversation.messages[0].role === 'system') {
-      return conversation.messages[0].content;
-    }
-    return PromptMemoryService.buildSystemPrompt(domain);
-  }
-
-  async saveConversation(conversation, userMessage, response, usedModel, fullResponseMessage, startTime) {
-    // ... lógica de persistencia extraída de processMessage ...
-    // Esto incluiría guardar los mensajes del usuario y del asistente,
-    // calcular tokens si es posible, y actualizar metadatos.
-    conversation.messages.push({ role: 'user', content: userMessage, timestamp: new Date() });
-    conversation.messages.push({
-      role: 'assistant',
-      content: fullResponseMessage,
-      timestamp: new Date(),
-      metadata: { model: usedModel },
-    });
-    conversation.metadata.totalMessages += 2;
-    await conversation.save();
-    logger.info(`[${'chat-orchestrator.service.js'}] ✅ Conversación guardada post-stream.`);
   }
 }
 
