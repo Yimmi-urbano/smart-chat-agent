@@ -356,6 +356,8 @@ class ChatOrchestratorService {
               message: 'Lo siento, estoy teniendo problemas técnicos en este momento. Por favor, intenta de nuevo en unos momentos.',
               audio_description: 'Lo siento, estoy teniendo problemas técnicos. Por favor, intenta de nuevo.',
               action: { type: 'none', productId: null, quantity: null, url: null, price_sale: null, title: null, price_regular: null, image: null, slug: null },
+              usage: { input: 0, output: 0, thinking: 0, cached: 0, total: 0 },
+              usageMetadata: { promptTokenCount: 0, candidatesTokenCount: 0, thinkingTokenCount: 0 },
             };
             usedModel = 'error_fallback';
             thinkingUsed = false;
@@ -369,6 +371,8 @@ class ChatOrchestratorService {
             message: 'Lo siento, estoy teniendo problemas técnicos en este momento. Por favor, intenta de nuevo en unos momentos.',
             audio_description: 'Lo siento, estoy teniendo problemas técnicos. Por favor, intenta de nuevo.',
             action: { type: 'none', productId: null, quantity: null, url: null, price_sale: null, title: null, price_regular: null, image: null, slug: null },
+            usage: { input: 0, output: 0, thinking: 0, cached: 0, total: 0 },
+            usageMetadata: { promptTokenCount: 0, candidatesTokenCount: 0, thinkingTokenCount: 0 },
           };
           usedModel = 'error_fallback';
           thinkingUsed = false;
