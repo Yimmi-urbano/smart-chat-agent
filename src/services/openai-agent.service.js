@@ -250,24 +250,30 @@ class OpenAIAgentService {
     try {
       // OPTIMIZACIÓN: Usar prompt corto después del primer mensaje para reducir tokens
       const PromptMemoryService = require('./prompt-memory.service');
-      let systemMessage = null;
-      let messagesForAPI = [];
+      let systemMessage;
+      let messagesForAPI;
 
-      if (conversationHistory.length > 0 && conversationHistory[0].role === 'system') {
+      // La conversación siempre tiene al menos el prompt de sistema.
+      // Si tiene más de 1 mensaje, es una conversación existente.
+      const isFirstUserMessage = conversationHistory.length === 1;
+
+      if (isFirstUserMessage) {
+        // Primera vez: usar el system prompt completo
+        systemMessage = systemPrompt;
+        messagesForAPI = [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage },
+        ];
+        logger.info(`[${FILE_NAME}] Using full system prompt (first message) (${systemPrompt.length} chars)`);
+      } else {
         // Ya hay conversación: usar prompt corto para ahorrar tokens
-        // El contexto ya está establecido, solo necesitamos instrucciones mínimas
         const shortPrompt = PromptMemoryService.buildShortSystemPrompt(domain);
         systemMessage = shortPrompt;
         
-        // Filtrar el system prompt largo del historial y usar el corto
+        // Filtrar el system prompt largo del historial
         const conversationMessages = conversationHistory.slice(1);
         
         logger.info(`[${FILE_NAME}] Preparing messages: short prompt (${shortPrompt.length} chars) + ${conversationMessages.length} history messages`);
-        logger.info(`[${FILE_NAME}] History messages details:`);
-        conversationMessages.forEach((msg, idx) => {
-          const preview = msg.content.substring(0, 60).replace(/\n/g, ' ');
-          logger.info(`[${FILE_NAME}]   [${idx}] ${msg.role}: "${preview}${msg.content.length > 60 ? '...' : ''}"`);
-        });
         
         messagesForAPI = [
           { role: 'system', content: shortPrompt },
@@ -276,17 +282,6 @@ class OpenAIAgentService {
         ];
         
         logger.info(`[${FILE_NAME}] Using short system prompt to reduce tokens (${shortPrompt.length} chars)`);
-        logger.info(`[${FILE_NAME}] Total messages to send: ${messagesForAPI.length}`);
-      } else {
-        // Primera vez: usar el system prompt completo
-        systemMessage = systemPrompt;
-        messagesForAPI = [
-          { role: 'system', content: systemPrompt },
-          ...conversationHistory,
-          { role: 'user', content: userMessage },
-        ];
-        
-        logger.info(`[${FILE_NAME}] Using full system prompt (first message) (${systemPrompt.length} chars)`);
       }
 
       // Generar hash del system prompt para cache
