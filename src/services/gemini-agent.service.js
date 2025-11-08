@@ -263,112 +263,120 @@ class GeminiAgentService {
    * 
    * MEJORA: Mantiene el system prompt en el historial (memorizado)
    */
-  async generateResponse(userMessage, conversationHistory, domain, systemPrompt, useThinking = false, stream = false) {
+  async generateResponse(userMessage, conversationHistory, domain, systemPrompt, useThinking = false) {
     try {
-      // OPTIMIZACIÓN: Usar prompt corto después del primer mensaje para reducir tokens
-      const PromptMemoryService = require('./prompt-memory.service');
-      let messages;
-      const isFirstUserMessage = conversationHistory.length === 1;
+      const messages = this._prepareMessages(userMessage, conversationHistory, domain, systemPrompt);
+      const model = this._getModel(useThinking);
 
-      if (isFirstUserMessage) {
-        // Primera vez: usar el system prompt completo
-        messages = [
-          { role: 'user', parts: [{ text: systemPrompt }] },
-          { role: 'model', parts: [{ text: '¡Hola! ¿En qué puedo ayudarte hoy?' }] }, // Simular una respuesta inicial para establecer el contexto
-        ];
-        logger.info('[Gemini] Using full system prompt (first message)');
-      } else {
-        // Ya hay conversación: usar prompt corto para ahorrar tokens
-        const shortPrompt = PromptMemoryService.buildShortSystemPrompt(domain);
-        
-        // Filtrar el system prompt largo del historial
-        const conversationMessages = conversationHistory.slice(1);
-        
-        logger.info(`[Gemini] Preparing messages: short prompt (${shortPrompt.length} chars) + ${conversationMessages.length} history messages`);
-        
-        messages = [
-          { role: 'user', parts: [{ text: shortPrompt }] },
-          ...conversationMessages.map(msg => ({
-            role: msg.role === 'assistant' ? 'model' : 'user',
-            parts: [{ text: msg.content }],
-          })),
-        ];
-        
-        logger.info(`[Gemini] Using short system prompt + ${conversationMessages.length} history messages to reduce tokens`);
-      }
-
-      // Agregar el mensaje actual del usuario
-      messages.push({ role: 'user', parts: [{ text: userMessage }] });
-
-      // Configurar generación
-      const generationConfig = {
-        temperature: config.gemini.temperature,
-        maxOutputTokens: config.gemini.maxTokens,
-      };
-
-      // Solo usar thinkingMode si el modelo lo soporta
-      // thinkingMode solo está disponible en modelos experimentales como gemini-2.0-flash-exp
-      // NO está disponible en gemini-2.5-flash, gemini-1.5-flash, etc.
-      const thinkingSupportedModels = ['gemini-2.0-flash-exp', 'gemini-2.0-flash-thinking-exp'];
-      const modelSupportsThinking = thinkingSupportedModels.includes(config.gemini.model);
-      
-      if (useThinking && config.features.thinkingMode && modelSupportsThinking) {
-        generationConfig.thinkingMode = 'AUTO';
-        logger.info(`[Gemini] Using thinking mode for model: ${config.gemini.model}`);
-      } else if (useThinking && !modelSupportsThinking) {
-        logger.warn(`[Gemini] Thinking mode requested but model ${config.gemini.model} does not support it. Ignoring.`);
-      }
-
-      // Crear modelo con tools
-      const model = this.genAI.getGenerativeModel({
-        model: config.gemini.model,
-        generationConfig,
-      });
-
-      // Generar respuesta con tools
       const chat = model.startChat({
         history: messages.slice(0, -1),
         tools: [{ functionDeclarations: this.tools }],
       });
 
-      if (stream) {
-        const result = await chat.sendMessageStream(messages[messages.length - 1].parts[0].text);
-        return result.stream;
-      }
-
       const result = await chat.sendMessage(messages[messages.length - 1].parts[0].text);
-      
-      // Verificar si hay function calls
+
       let functionResults = [];
       const responseData = await result.response;
       const functionCalls = responseData.functionCalls() || [];
-      
+
       if (Array.isArray(functionCalls) && functionCalls.length > 0) {
         for (const call of functionCalls) {
           const fnResult = await this.executeFunction(call.name, call.args, domain);
-          functionResults.push({
-            functionName: call.name,
-            result: fnResult,
-          });
+          functionResults.push({ functionName: call.name, result: fnResult });
         }
 
-        // Enviar resultados de vuelta a Gemini
         const finalResult = await chat.sendMessage([{
           functionResponse: {
             name: functionCalls[0].name,
             response: functionResults[0].result,
-          }
+          },
         }]);
 
         return this.parseResponse(finalResult.response, functionResults);
       }
 
       return this.parseResponse(result.response, []);
-
     } catch (error) {
       logger.error('[Gemini] Error generating response:', error);
       throw error;
     }
+  }
+
+  /**
+   * Genera respuesta como un stream de datos.
+   */
+  async generateResponseStream(userMessage, conversationHistory, domain, systemPrompt, useThinking = false) {
+    try {
+      const messages = this._prepareMessages(userMessage, conversationHistory, domain, systemPrompt);
+      const model = this._getModel(useThinking);
+
+      const chat = model.startChat({
+        history: messages.slice(0, -1),
+        tools: [{ functionDeclarations: this.tools }],
+      });
+
+      const result = await chat.sendMessageStream(messages[messages.length - 1].parts[0].text);
+      return result.stream;
+    } catch (error) {
+      logger.error('[Gemini] Error generating stream response:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Prepara el historial de mensajes para la API de Gemini.
+   */
+  _prepareMessages(userMessage, conversationHistory, domain, systemPrompt) {
+    const PromptMemoryService = require('./prompt-memory.service');
+    const isFirstUserMessage = conversationHistory.filter(m => m.role === 'user').length === 0;
+
+    let messages;
+    if (isFirstUserMessage) {
+      messages = [
+        { role: 'user', parts: [{ text: systemPrompt }] },
+        { role: 'model', parts: [{ text: '¡Hola! ¿En qué puedo ayudarte hoy?' }] },
+      ];
+      logger.info('[Gemini] Using full system prompt (first message)');
+    } else {
+      const shortPrompt = PromptMemoryService.buildShortSystemPrompt(domain);
+      const conversationMessages = conversationHistory.filter(m => m.role !== 'system');
+      messages = [
+        { role: 'user', parts: [{ text: shortPrompt }] },
+        ...conversationMessages.map(msg => ({
+          role: msg.role === 'assistant' ? 'model' : 'user',
+          parts: [{ text: msg.content }],
+        })),
+      ];
+      logger.info(`[Gemini] Using short prompt + ${conversationMessages.length} history messages`);
+    }
+
+    messages.push({ role: 'user', parts: [{ text: userMessage }] });
+    return messages;
+  }
+
+  /**
+   * Configura y devuelve el modelo generativo.
+   */
+  _getModel(useThinking) {
+    const generationConfig = {
+      temperature: config.gemini.temperature,
+      maxOutputTokens: config.gemini.maxTokens,
+    };
+
+    const thinkingSupportedModels = ['gemini-2.0-flash-exp', 'gemini-2.0-flash-thinking-exp'];
+    const modelSupportsThinking = thinkingSupportedModels.includes(config.gemini.model);
+
+    if (useThinking && config.features.thinkingMode && modelSupportsThinking) {
+      generationConfig.thinkingMode = 'AUTO';
+      logger.info(`[Gemini] Using thinking mode for model: ${config.gemini.model}`);
+    } else if (useThinking && !modelSupportsThinking) {
+      logger.warn(`[Gemini] Thinking mode requested but model ${config.gemini.model} does not support it. Ignoring.`);
+    }
+
+    return this.genAI.getGenerativeModel({
+      model: config.gemini.model,
+      generationConfig,
+    });
   }
 
   /**

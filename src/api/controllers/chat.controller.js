@@ -12,6 +12,10 @@ const logger = require('../../utils/logger');
 class ChatController {
   constructor() {
     this.orchestrator = new ChatOrchestratorService();
+    this.sendMessage = this.sendMessage.bind(this);
+    this.getHistory = this.getHistory.bind(this);
+    this.closeConversation = this.closeConversation.bind(this);
+    this.getStats = this.getStats.bind(this);
   }
 
   /**

@@ -244,182 +244,140 @@ class OpenAIAgentService {
    * Esto reduce tokens en 85-95% en mensajes subsecuentes
    * OPTIMIZACIÓN: Usa function calling para buscar productos sin enviarlos en el prompt
    */
-  async generateResponse(userMessage, conversationHistory, domain, systemPrompt, stream = false) {
-    const FILE_NAME = 'openai-agent.service.js';
-    
+  async generateResponse(userMessage, conversationHistory, domain, systemPrompt) {
     try {
-      // OPTIMIZACIÓN: Usar prompt corto después del primer mensaje para reducir tokens
-      const PromptMemoryService = require('./prompt-memory.service');
-      let systemMessage;
-      let messagesForAPI;
-
-      // La conversación siempre tiene al menos el prompt de sistema.
-      // Si tiene más de 1 mensaje, es una conversación existente.
-      const isFirstUserMessage = conversationHistory.length === 1;
-
-      if (isFirstUserMessage) {
-        // Primera vez: usar el system prompt completo
-        systemMessage = systemPrompt;
-        messagesForAPI = [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userMessage },
-        ];
-        logger.info(`[${FILE_NAME}] Using full system prompt (first message) (${systemPrompt.length} chars)`);
-      } else {
-        // Ya hay conversación: usar prompt corto para ahorrar tokens
-        const shortPrompt = PromptMemoryService.buildShortSystemPrompt(domain);
-        systemMessage = shortPrompt;
-        
-        // Filtrar el system prompt largo del historial
-        const conversationMessages = conversationHistory.slice(1);
-        
-        logger.info(`[${FILE_NAME}] Preparing messages: short prompt (${shortPrompt.length} chars) + ${conversationMessages.length} history messages`);
-        
-        messagesForAPI = [
-          { role: 'system', content: shortPrompt },
-          ...conversationMessages,
-          { role: 'user', content: userMessage },
-        ];
-        
-        logger.info(`[${FILE_NAME}] Using short system prompt to reduce tokens (${shortPrompt.length} chars)`);
-      }
-
-      // Generar hash del system prompt para cache
-      const systemPromptHash = this.getSystemPromptHash(systemMessage);
-
-      // Configurar request con function calling
-      const requestOptions = {
-        model: config.openai.model,
-        messages: messagesForAPI,
-        temperature: config.openai.temperature,
-        max_tokens: config.openai.maxTokens,
-        tools: this.tools,
-        tool_choice: 'auto', // Permite que el modelo decida cuándo usar las funciones
-        stream,
-      };
-
-      // MEJORA: Agregar prompt caching si está habilitado
-      if (config.features.promptCaching && systemMessage && messagesForAPI[0]?.role === 'system') {
-        logger.info(`[OpenAI] Prompt caching enabled (system prompt hash: ${systemPromptHash.substring(0, 8)}...)`);
-      }
-
-      const completion = await this.client.chat.completions.create(requestOptions);
-
-      if (stream) {
-        return completion;
-      }
+      const { requestOptions, messagesForAPI, systemPromptHash } = this._prepareApiRequest(userMessage, conversationHistory, domain, systemPrompt);
+      const completion = await this.client.chat.completions.create({ ...requestOptions, stream: false });
 
       let message = completion.choices[0].message;
+      let currentMessages = [...messagesForAPI];
       let functionResults = [];
 
-      // Manejar function calls si existen
       while (message.tool_calls && message.tool_calls.length > 0) {
-        // Agregar el mensaje del asistente con tool calls al historial
-        messagesForAPI.push(message);
+        currentMessages.push(message);
 
-        // Ejecutar todas las funciones llamadas
         for (const toolCall of message.tool_calls) {
           const functionName = toolCall.function.name;
           const functionArgs = JSON.parse(toolCall.function.arguments);
-          
           const functionResult = await this.executeFunction(functionName, functionArgs, domain);
           
-          // Agregar resultado de la función al historial
-          messagesForAPI.push({
+          currentMessages.push({
             role: 'tool',
             tool_call_id: toolCall.id,
             content: JSON.stringify(functionResult),
           });
-
-          functionResults.push({
-            functionName,
-            result: functionResult,
-          });
+          functionResults.push({ functionName, result: functionResult });
         }
 
-        // Obtener respuesta final del modelo
         const newCompletion = await this.client.chat.completions.create({
           ...requestOptions,
-          messages: messagesForAPI,
-          stream: false, // El segundo paso no puede ser stream
+          messages: currentMessages,
+          stream: false,
         });
         message = newCompletion.choices[0].message;
       }
 
-      // Parsear respuesta final
-      let parsedResponse;
-      const rawResponse = message.content;
-
-      try {
-        parsedResponse = JSON.parse(rawResponse);
-      } catch (parseError) {
-        // Si no es JSON, intentar extraer JSON de markdown
-        const jsonMatch = rawResponse.match(/```(?:json)?\s*([\s\S]*?)```/);
-        if (jsonMatch) {
-          parsedResponse = JSON.parse(jsonMatch[1].trim());
-        } else {
-          // Si no hay JSON, crear respuesta básica
-          parsedResponse = {
-            message: rawResponse || 'He encontrado información. ¿Puedo ayudarte con algo más?',
-            audio_description: rawResponse || 'Encontré información',
-            action: {
-              type: 'none',
-              productId: null,
-              quantity: null,
-              url: null,
-              price_sale: null,
-              title: null,
-              price_regular: null,
-              image: null,
-              slug: null,
-            },
-          };
-        }
-      }
-
-      // Calcular tokens
-      const usage = completion.usage || {};
-      const tokenData = {
-        input: usage.prompt_tokens || 0,
-        output: usage.completion_tokens || 0,
-        thinking: 0,
-        cached: usage.cached_tokens || 0, // Tokens cacheados (ahorro)
-        total: usage.total_tokens || 0,
-      };
-
-      // Log de ahorro de tokens
-      if (tokenData.cached > 0) {
-        const savings = ((tokenData.cached / tokenData.input) * 100).toFixed(1);
-        logger.info(`[OpenAI] 💰 Token savings: ${tokenData.cached} cached tokens (${savings}% reduction)`);
-      }
-
-      if (functionResults.length > 0) {
-        logger.info(`[OpenAI] ✅ Executed ${functionResults.length} function calls`);
-      }
-
-      return {
-        message: parsedResponse.message || '',
-        audio_description: parsedResponse.audio_description || parsedResponse.message || '',
-        action: parsedResponse.action || {
-          type: 'none',
-          productId: null,
-          quantity: null,
-          url: null,
-          price_sale: null,
-          title: null,
-          price_regular: null,
-          image: null,
-          slug: null,
-        },
-        usage: tokenData,
-        systemPromptHash,
-        functionResults,
-      };
+      return this._parseFinalResponse(message.content, completion, systemPromptHash, functionResults);
 
     } catch (error) {
       logger.error('[OpenAI] Error generating response:', error);
       throw error;
     }
+  }
+
+  async generateResponseStream(userMessage, conversationHistory, domain, systemPrompt) {
+    try {
+      const { requestOptions } = this._prepareApiRequest(userMessage, conversationHistory, domain, systemPrompt);
+      const stream = await this.client.chat.completions.create({ ...requestOptions, stream: true });
+      return stream;
+    } catch (error) {
+      logger.error('[OpenAI] Error generating stream response:', error);
+      throw error;
+    }
+  }
+
+  _prepareApiRequest(userMessage, conversationHistory, domain, systemPrompt) {
+    const PromptMemoryService = require('./prompt-memory.service');
+    const isFirstUserMessage = conversationHistory.filter(m => m.role === 'user').length === 0;
+
+    let systemMessage;
+    let messagesForAPI;
+
+    if (isFirstUserMessage) {
+      systemMessage = systemPrompt;
+      messagesForAPI = [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMessage },
+      ];
+      logger.info(`[OpenAI] Using full system prompt for first message (${systemPrompt.length} chars)`);
+    } else {
+      const shortPrompt = PromptMemoryService.buildShortSystemPrompt(domain);
+      systemMessage = shortPrompt;
+      const conversationMessages = conversationHistory.filter(m => m.role !== 'system');
+      messagesForAPI = [
+        { role: 'system', content: shortPrompt },
+        ...conversationMessages,
+        { role: 'user', content: userMessage },
+      ];
+      logger.info(`[OpenAI] Using short prompt for subsequent messages (${shortPrompt.length} chars)`);
+    }
+
+    const systemPromptHash = this.getSystemPromptHash(systemMessage);
+
+    const requestOptions = {
+      model: config.openai.model,
+      messages: messagesForAPI,
+      temperature: config.openai.temperature,
+      max_tokens: config.openai.maxTokens,
+      tools: this.tools,
+      tool_choice: 'auto',
+    };
+
+    if (config.features.promptCaching) {
+      logger.info(`[OpenAI] Prompt caching enabled (hash: ${systemPromptHash.substring(0, 8)})`);
+    }
+
+    return { requestOptions, messagesForAPI, systemPromptHash };
+  }
+
+  _parseFinalResponse(rawResponse, completion, systemPromptHash, functionResults) {
+    let parsedResponse;
+    try {
+      parsedResponse = JSON.parse(rawResponse);
+    } catch (e) {
+      const jsonMatch = rawResponse.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (jsonMatch) {
+        try {
+          parsedResponse = JSON.parse(jsonMatch[1].trim());
+        } catch (e2) {
+          parsedResponse = { message: rawResponse };
+        }
+      } else {
+        parsedResponse = { message: rawResponse };
+      }
+    }
+
+    const usage = completion.usage || {};
+    const tokenData = {
+      input: usage.prompt_tokens || 0,
+      output: usage.completion_tokens || 0,
+      cached: usage.cached_tokens || 0,
+      total: usage.total_tokens || 0,
+    };
+
+    if (tokenData.cached > 0) {
+      const savings = ((tokenData.cached / (tokenData.input + tokenData.cached)) * 100).toFixed(1);
+      logger.info(`[OpenAI] 💰 Token savings: ${tokenData.cached} cached tokens (${savings}% reduction)`);
+    }
+
+    return {
+      message: parsedResponse.message || 'He encontrado información. ¿Puedo ayudarte con algo más?',
+      audio_description: parsedResponse.audio_description || parsedResponse.message,
+      action: parsedResponse.action || { type: 'none' },
+      usage: tokenData,
+      systemPromptHash,
+      functionResults,
+    };
   }
 }
 
