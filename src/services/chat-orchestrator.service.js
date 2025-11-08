@@ -193,9 +193,10 @@ class ChatOrchestratorService {
 
   async _prepareConversation(userMessage, conversation, domain) {
     const FILE_NAME = 'chat-orchestrator.service.js';
-    const systemPrompt = await PromptMemoryService.buildSystemPrompt(domain);
-    const history = this.getRecentHistory(conversation);
-    logger.info(`[${FILE_NAME}] [PASO 1/5] ✅ Preparación completa`);
+    try {
+        const systemPrompt = await PromptMemoryService.buildSystemPrompt(domain);
+        const history = this.getRecentHistory(conversation);
+        logger.info(`[${FILE_NAME}] [PASO 1/5] ✅ Preparación completa`);
 
     logger.info(`[${FILE_NAME}] [PASO 2/5] INTERPRETACIÓN: Analizando intención...`);
     let interpretedIntent = null;
@@ -214,6 +215,10 @@ class ChatOrchestratorService {
         logger.error(`[${FILE_NAME}] [PASO 2/5] ❌ Error en interpretación: ${error.message}`);
     }
      return { systemPrompt, history, interpretedIntent, toolResult, dynamicPrompt };
+    } catch (error) {
+        logger.error(`[${FILE_NAME}] ❌ ERROR FATAL en _prepareConversation: ${error.message}`);
+        throw new Error('No se pudo preparar la conversación: ' + error.message);
+    }
   }
 
   async _performFallback(originalModel, userMessage, history, domain, finalSystemPrompt) {

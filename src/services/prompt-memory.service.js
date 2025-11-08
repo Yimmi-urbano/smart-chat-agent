@@ -125,13 +125,8 @@ class PromptMemoryService {
 
       return catalogData;
     } catch (error) {
-      logger.error(`[PromptMemory] Error loading product catalog for ${domain}:`, error.message);
-      return {
-        text: 'No hay productos disponibles en el catálogo. Usa la función search_products para buscar.',
-        count: 0,
-        categories: [],
-        featuredProducts: [],
-      };
+      logger.error(`[PromptMemory] CRITICAL: Failed to load product catalog for domain ${domain}. This is a fatal error.`, { errorMessage: error.message, stack: error.stack });
+      throw new Error(`Failed to load product catalog for domain ${domain}.`);
     }
   }
 
