@@ -14,49 +14,47 @@ const logger = require('../utils/logger');
 class ModelRouterService {
   /**
    * Decide qué modelo usar basándose en la complejidad del mensaje
-   * @returns {string} 'gemini' | 'openai'
+   * @returns {string} 'gemini' | 'openai' | 'groq'
    */
   static decideModel(userMessage, conversationHistory = []) {
+    const config = require('../config/env.config');
+    
+    // OPTIMIZACIÓN: Usar Gemini por defecto para búsquedas de productos (más rápido y confiable)
+    // Groq tiene problemas de rate limiting y fallbacks, mejor usar Gemini directamente
     const message = userMessage.toLowerCase().trim();
 
     // Casos triviales -> OpenAI (más rápido y con prompt caching)
     if (this.isTrivialMessage(message)) {
-      logger.info('[Router] Using openai: Trivial message detected');
       return 'openai';
     }
 
-    // Búsqueda de productos -> Gemini (Function Calling, GRATIS)
+    // Búsqueda de productos -> Gemini (Function Calling, GRATIS, más rápido)
+    // OPTIMIZACIÓN: Gemini es más rápido y confiable que Groq para function calling
     if (this.detectsProductIntent(message)) {
-      logger.info('[Router] Using gemini: Product search detected');
       return 'gemini';
     }
 
     // Comparaciones -> Gemini (mejor razonamiento, GRATIS)
     if (this.requiresComparison(message)) {
-      logger.info('[Router] Using gemini: Comparison required');
       return 'gemini';
     }
 
     // Cálculos o lógica compleja -> Gemini (GRATIS)
     if (this.requiresCalculation(message)) {
-      logger.info('[Router] Using gemini: Calculation required');
       return 'gemini';
     }
 
     // Múltiples condiciones -> Gemini (GRATIS)
     if (this.hasMultipleConditions(message)) {
-      logger.info('[Router] Using gemini: Multiple conditions detected');
       return 'gemini';
     }
 
     // Preguntas sobre funcionalidades -> Gemini (thinking mode, GRATIS)
     if (this.requiresThinking(message)) {
-      logger.info('[Router] Using gemini: Thinking mode required');
       return 'gemini';
     }
 
     // Default: OpenAI (conversaciones generales con prompt caching)
-    logger.info('[Router] Using openai: Default conversational response (with prompt caching)');
     return 'openai';
   }
 

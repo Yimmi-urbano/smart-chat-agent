@@ -41,8 +41,6 @@ class ChatController {
         );
       }
 
-      logger.info(`[Chat] Processing message from user ${userId} on domain ${domain}`);
-
       if (stream) {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -67,7 +65,14 @@ class ChatController {
           forceModel,
         });
 
-        return ResponseUtil.success(res, response, 'Message processed successfully');
+        // Formatear respuesta según el formato esperado por el frontend
+        const assistantMessage = {
+          message: response.message || '',
+          audio_description: response.audio_description || response.message || '',
+          action: response.action || { type: 'none' },
+        };
+
+        return ResponseUtil.success(res, { assistantMessage }, 'Message processed successfully');
       }
     } catch (error) {
       logger.error('[Chat] Error in sendMessage:', error);

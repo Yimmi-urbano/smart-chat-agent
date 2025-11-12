@@ -13,6 +13,7 @@ const config = require('../config/env.config');
 const logger = require('../utils/logger');
 const crypto = require('crypto');
 const getProductModel = require('../models/Product');
+const ToolExecutorService = require('./tool-executor.service');
 
 class OpenAIAgentService {
   constructor() {
@@ -38,7 +39,7 @@ class OpenAIAgentService {
         type: 'function',
         function: {
           name: 'search_products',
-          description: 'Busca productos en el catálogo usando búsqueda inteligente y flexible. Entiende conceptos relacionados y sinónimos. Ejemplo: si el usuario busca "cargadores portátiles", también busca productos relacionados como "batería portátil" o "power bank".',
+          description: 'Busca productos en el catálogo usando búsqueda inteligente y flexible. DEBES usar esta herramienta para CUALQUIER consulta sobre productos. Entiende conceptos relacionados y sinónimos. Ejemplo: si el usuario busca "cargadores portátiles", también busca productos relacionados como "batería portátil" o "power bank".',
           parameters: {
             type: 'object',
             properties: {
@@ -48,15 +49,15 @@ class OpenAIAgentService {
               },
               category: {
                 type: 'string',
-                description: 'Categoría del producto',
+                description: 'Categoría del producto (opcional)',
               },
               minPrice: {
                 type: 'number',
-                description: 'Precio mínimo',
+                description: 'Precio mínimo (opcional)',
               },
               maxPrice: {
                 type: 'number',
-                description: 'Precio máximo',
+                description: 'Precio máximo (opcional)',
               },
               limit: {
                 type: 'number',
@@ -71,7 +72,36 @@ class OpenAIAgentService {
         type: 'function',
         function: {
           name: 'get_product_details',
-          description: 'Obtiene detalles completos de un producto específico por su ID o slug',
+          description: 'Obtiene detalles completos de un producto específico por su ID o slug. USA esta herramienta cuando el usuario pide detalles, características o información específica de un producto.',
+          parameters: {
+            type: 'object',
+            properties: {
+              productId: {
+                type: 'string',
+                description: 'ID o slug del producto. Puede ser el ID completo o el slug del producto.',
+              },
+            },
+            required: ['productId'],
+          },
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'search_info_business',
+          description: 'Obtiene información de la empresa/negocio. USA esta herramienta cuando el usuario pregunta sobre la empresa, quiénes son, qué hacen, información de contacto, etc.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            required: [],
+          },
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'get_product_price',
+          description: 'Obtiene el precio de un producto específico. USA esta herramienta cuando el usuario pregunta por el precio, cuánto cuesta, o el costo de un producto.',
           parameters: {
             type: 'object',
             properties: {
@@ -84,25 +114,83 @@ class OpenAIAgentService {
           },
         },
       },
+      {
+        type: 'function',
+        function: {
+          name: 'search_product_recommended',
+          description: 'Busca productos recomendados o destacados. USA esta herramienta cuando el usuario pide recomendaciones, productos destacados, o productos populares.',
+          parameters: {
+            type: 'object',
+            properties: {
+              limit: {
+                type: 'number',
+                description: 'Número máximo de productos recomendados (default: 5)',
+              },
+            },
+            required: [],
+          },
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'get_shipping_info',
+          description: 'Obtiene información sobre envíos, políticas de envío, costos de envío, etc. USA esta herramienta cuando el usuario pregunta sobre envíos, delivery, costos de envío, políticas de envío, etc.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            required: [],
+          },
+        },
+      },
     ];
   }
 
   /**
    * Ejecuta una función llamada por OpenAI
+   * Mapea los nombres de funciones de OpenAI a los intents de ToolExecutorService
    */
   async executeFunction(functionName, args, domain) {
-    logger.info(`[OpenAI] Executing function: ${functionName}`);
+    const FILE_NAME = 'openai-agent.service.js';
 
-    switch (functionName) {
-      case 'search_products':
-        return await this.searchProducts(args, domain);
-      
-      case 'get_product_details':
-        return await this.getProductDetails(args.productId, domain);
-      
-      default:
-        throw new Error(`Unknown function: ${functionName}`);
+    // Mapear nombres de funciones de OpenAI a intents de ToolExecutorService
+    const functionToIntentMap = {
+      'search_products': 'search_products',
+      'get_product_details': 'product_details',
+      'search_info_business': 'company_info',
+      'get_product_price': 'product_price',
+      'search_product_recommended': 'search_products', // Los productos recomendados se buscan como search_products
+      'get_shipping_info': 'shipping_info',
+    };
+
+    const intent = functionToIntentMap[functionName];
+    if (!intent) {
+      logger.error(`[${FILE_NAME}] ❌ Función desconocida: ${functionName}`);
+      throw new Error(`Unknown function: ${functionName}`);
     }
+
+    // Preparar parámetros según el intent
+    let params = {};
+    if (functionName === 'search_product_recommended') {
+      // Para productos recomendados, buscar sin query específica o con query genérico
+      params = { query: '', limit: args.limit || 5 };
+    } else if (functionName === 'get_product_details' || functionName === 'get_product_price') {
+      params = { productId: args.productId };
+    } else if (functionName === 'search_products') {
+      params = args;
+    }
+    // company_info y shipping_info no necesitan parámetros
+
+    // Ejecutar tool usando ToolExecutorService
+    const result = await ToolExecutorService.executeTool(intent, params, domain);
+    
+    if (!result) {
+      logger.warn(`[${FILE_NAME}] ⚠️ Tool no retornó resultado para: ${functionName}`);
+      return { error: 'No se pudo obtener la información solicitada' };
+    }
+
+    // Retornar solo los datos (sin el wrapper de tool)
+    return result.data || result;
   }
 
   /**
@@ -165,8 +253,6 @@ class OpenAIAgentService {
     } else {
       products = products.slice(0, Math.min(limit, 10));
     }
-
-    logger.info(`[OpenAI] ✅ Found ${products.length} products for query: "${query}"`);
 
     return {
       count: products.length,
@@ -245,15 +331,19 @@ class OpenAIAgentService {
    * OPTIMIZACIÓN: Usa function calling para buscar productos sin enviarlos en el prompt
    */
   async generateResponse(userMessage, conversationHistory, domain, systemPrompt) {
+    const FILE_NAME = 'openai-agent.service.js';
     try {
       const { requestOptions, messagesForAPI, systemPromptHash } = this._prepareApiRequest(userMessage, conversationHistory, domain, systemPrompt);
+      
       const completion = await this.client.chat.completions.create({ ...requestOptions, stream: false });
 
       let message = completion.choices[0].message;
       let currentMessages = [...messagesForAPI];
       let functionResults = [];
+      let functionCallRound = 0;
 
       while (message.tool_calls && message.tool_calls.length > 0) {
+        functionCallRound++;
         currentMessages.push(message);
 
         for (const toolCall of message.tool_calls) {
@@ -277,10 +367,83 @@ class OpenAIAgentService {
         message = newCompletion.choices[0].message;
       }
 
-      return this._parseFinalResponse(message.content, completion, systemPromptHash, functionResults);
+      const parsed = this._parseFinalResponse(message.content, completion, systemPromptHash, functionResults);
+      return parsed;
 
     } catch (error) {
-      logger.error('[OpenAI] Error generating response:', error);
+      // Log detallado del error de OpenAI
+      logger.error(`[${FILE_NAME}] ❌❌❌ ERROR EN OPENAI: ${error.message}`);
+      logger.error(`[${FILE_NAME}] ❌ Tipo de error: ${error.constructor?.name || 'Unknown'}`);
+      logger.error(`[${FILE_NAME}] ❌ Stack: ${error.stack}`);
+      
+      // Información adicional del error de OpenAI
+      if (error.status) {
+        logger.error(`[${FILE_NAME}] ❌ Status code: ${error.status}`);
+      }
+      if (error.statusText) {
+        logger.error(`[${FILE_NAME}] ❌ Status text: ${error.statusText}`);
+      }
+      if (error.code) {
+        logger.error(`[${FILE_NAME}] ❌ Error code: ${error.code}`);
+      }
+      if (error.type) {
+        logger.error(`[${FILE_NAME}] ❌ Error type: ${error.type}`);
+      }
+      if (error.param) {
+        logger.error(`[${FILE_NAME}] ❌ Error param: ${error.param}`);
+      }
+      if (error.request_id) {
+        logger.error(`[${FILE_NAME}] ❌ Request ID: ${error.request_id}`);
+      }
+      if (error.response) {
+        logger.error(`[${FILE_NAME}] ❌ Response data: ${JSON.stringify(error.response)}`);
+      }
+      if (error.error) {
+        logger.error(`[${FILE_NAME}] ❌ Error object: ${JSON.stringify(error.error)}`);
+      }
+      if (error.headers) {
+        logger.error(`[${FILE_NAME}] ❌ Response headers: ${JSON.stringify(error.headers)}`);
+      }
+      
+      // Información específica de errores comunes
+      if (error.status === 429) {
+        logger.error(`[${FILE_NAME}] ⚠️⚠️⚠️ ERROR 429 - RATE LIMIT EXCEDIDO`);
+        if (error.error?.message) {
+          logger.error(`[${FILE_NAME}] ❌ Mensaje de error: ${error.error.message}`);
+        }
+        if (error.headers?.['x-ratelimit-limit-requests']) {
+          logger.error(`[${FILE_NAME}] ❌ Rate limit: ${error.headers['x-ratelimit-limit-requests']}`);
+        }
+        if (error.headers?.['x-ratelimit-remaining-requests']) {
+          logger.error(`[${FILE_NAME}] ❌ Requests restantes: ${error.headers['x-ratelimit-remaining-requests']}`);
+        }
+        if (error.headers?.['retry-after']) {
+          logger.error(`[${FILE_NAME}] ⏰ Retry after: ${error.headers['retry-after']} segundos`);
+        }
+      }
+      
+      if (error.code === 'insufficient_quota') {
+        logger.error(`[${FILE_NAME}] ⚠️⚠️⚠️ ERROR DE CUOTA: OpenAI ha excedido su cuota`);
+        if (error.error?.message) {
+          logger.error(`[${FILE_NAME}] ❌ Mensaje de cuota: ${error.error.message}`);
+        }
+      }
+      
+      // Log completo del error para debugging
+      logger.error(`[${FILE_NAME}] ❌ Error completo (JSON): ${JSON.stringify({
+        name: error.name,
+        message: error.message,
+        status: error.status,
+        statusText: error.statusText,
+        code: error.code,
+        type: error.type,
+        param: error.param,
+        request_id: error.request_id,
+        stack: error.stack?.split('\n').slice(0, 5).join('\n'),
+        error: error.error,
+        response: error.response,
+      }, null, 2)}`);
+      
       throw error;
     }
   }
@@ -295,38 +458,148 @@ class OpenAIAgentService {
       });
       return stream;
     } catch (error) {
-      logger.error('[OpenAI] Error generating stream response:', error);
+      const FILE_NAME = 'openai-agent.service.js';
+      // Log detallado del error de OpenAI en streaming
+      logger.error(`[${FILE_NAME}] ❌❌❌ ERROR EN OPENAI STREAM: ${error.message}`);
+      logger.error(`[${FILE_NAME}] ❌ Tipo de error: ${error.constructor?.name || 'Unknown'}`);
+      logger.error(`[${FILE_NAME}] ❌ Stack: ${error.stack}`);
+      
+      // Información adicional del error de OpenAI
+      if (error.status) {
+        logger.error(`[${FILE_NAME}] ❌ Status code: ${error.status}`);
+      }
+      if (error.statusText) {
+        logger.error(`[${FILE_NAME}] ❌ Status text: ${error.statusText}`);
+      }
+      if (error.code) {
+        logger.error(`[${FILE_NAME}] ❌ Error code: ${error.code}`);
+      }
+      if (error.type) {
+        logger.error(`[${FILE_NAME}] ❌ Error type: ${error.type}`);
+      }
+      if (error.param) {
+        logger.error(`[${FILE_NAME}] ❌ Error param: ${error.param}`);
+      }
+      if (error.request_id) {
+        logger.error(`[${FILE_NAME}] ❌ Request ID: ${error.request_id}`);
+      }
+      if (error.response) {
+        logger.error(`[${FILE_NAME}] ❌ Response data: ${JSON.stringify(error.response)}`);
+      }
+      if (error.error) {
+        logger.error(`[${FILE_NAME}] ❌ Error object: ${JSON.stringify(error.error)}`);
+      }
+      if (error.headers) {
+        logger.error(`[${FILE_NAME}] ❌ Response headers: ${JSON.stringify(error.headers)}`);
+      }
+      
+      // Información específica de errores comunes en streaming
+      if (error.status === 429) {
+        logger.error(`[${FILE_NAME}] ⚠️⚠️⚠️ ERROR 429 EN STREAM - RATE LIMIT EXCEDIDO`);
+        if (error.error?.message) {
+          logger.error(`[${FILE_NAME}] ❌ Mensaje de error: ${error.error.message}`);
+        }
+        if (error.headers?.['x-ratelimit-limit-requests']) {
+          logger.error(`[${FILE_NAME}] ❌ Rate limit: ${error.headers['x-ratelimit-limit-requests']}`);
+        }
+        if (error.headers?.['x-ratelimit-remaining-requests']) {
+          logger.error(`[${FILE_NAME}] ❌ Requests restantes: ${error.headers['x-ratelimit-remaining-requests']}`);
+        }
+        if (error.headers?.['retry-after']) {
+          logger.error(`[${FILE_NAME}] ⏰ Retry after: ${error.headers['retry-after']} segundos`);
+        }
+      }
+      
+      if (error.code === 'insufficient_quota') {
+        logger.error(`[${FILE_NAME}] ⚠️⚠️⚠️ ERROR DE CUOTA EN STREAM: OpenAI ha excedido su cuota`);
+        if (error.error?.message) {
+          logger.error(`[${FILE_NAME}] ❌ Mensaje de cuota: ${error.error.message}`);
+        }
+      }
+      
+      // Log completo del error para debugging
+      logger.error(`[${FILE_NAME}] ❌ Error completo en STREAM (JSON): ${JSON.stringify({
+        name: error.name,
+        message: error.message,
+        status: error.status,
+        statusText: error.statusText,
+        code: error.code,
+        type: error.type,
+        param: error.param,
+        request_id: error.request_id,
+        stack: error.stack?.split('\n').slice(0, 5).join('\n'),
+        error: error.error,
+        response: error.response,
+      }, null, 2)}`);
+      
       throw error;
     }
   }
 
   _prepareApiRequest(userMessage, conversationHistory, domain, systemPrompt) {
     const PromptMemoryService = require('./prompt-memory.service');
-    const isFirstUserMessage = conversationHistory.filter(m => m.role === 'user').length === 0;
-
-    let systemMessage;
-    let messagesForAPI;
-
-    if (isFirstUserMessage) {
-      systemMessage = systemPrompt;
-      messagesForAPI = [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userMessage },
-      ];
-      logger.info(`[OpenAI] Using full system prompt for first message (${systemPrompt.length} chars)`);
-    } else {
-      const shortPrompt = PromptMemoryService.buildShortSystemPrompt(domain);
-      systemMessage = shortPrompt;
-      const conversationMessages = conversationHistory.filter(m => m.role !== 'system');
-      messagesForAPI = [
-        { role: 'system', content: shortPrompt },
-        ...conversationMessages,
-        { role: 'user', content: userMessage },
-      ];
-      logger.info(`[OpenAI] Using short prompt for subsequent messages (${shortPrompt.length} chars)`);
+    
+    // ENFOQUE: Function calling puro
+    // - SIEMPRE usar prompt corto (solo instrucciones, sin datos)
+    // - La IA obtiene información usando tools dinámicamente
+    // - Cada mensaje del usuario incluye el mini system prompt
+    // - El mensaje actual del usuario incluye contexto de productos mencionados recientemente
+    const shortPrompt = PromptMemoryService.buildShortSystemPrompt(domain);
+    const conversationMessages = conversationHistory.filter(m => m.role !== 'system');
+    
+    // Extraer contexto de productos del historial reciente para mantener fluidez conversacional
+    let currentContext = '';
+    if (conversationMessages.length > 0) {
+      // Buscar en los últimos mensajes del asistente para encontrar productos mencionados
+      const assistantMessages = conversationMessages.filter(m => m.role === 'assistant').slice(-2);
+      
+      for (const assistantMsg of assistantMessages.reverse()) {
+        if (assistantMsg && assistantMsg.content) {
+          // Buscar [CONTEXTO_PRODUCTOS: ...] en el mensaje del asistente
+          const contextMatch = assistantMsg.content.match(/\[CONTEXTO_PRODUCTOS:([^\]]+)\]/);
+          if (contextMatch) {
+            const productInfo = contextMatch[1].trim();
+            // Extraer información del producto de forma estructurada
+            const productMatch = productInfo.match(/([^(]+)\s*\(ID:\s*([^,]+)(?:,\s*slug:\s*([^)]+))?\)/);
+            if (productMatch) {
+              const productName = productMatch[1].trim();
+              const productId = productMatch[2].trim();
+              const productSlug = productMatch[3] ? productMatch[3].trim() : null;
+              
+              // Crear contexto natural y fluido
+              currentContext = `\n\nCONTEXTO DE LA CONVERSACIÓN:\n- El producto que acabas de mencionar al cliente es: "${productName}" (ID: ${productId}${productSlug ? `, slug: ${productSlug}` : ''})\n- Si el cliente responde con palabras como "si", "sí", "ok", "está bien", "agrégalo", "agregalo", "dámelo", "lo quiero", etc., se está refiriendo a este producto.\n- Debes usar get_product_details con el ID o slug de este producto para obtener todos los datos y luego agregarlo al carrito.`;
+            } else {
+              // Fallback: usar la información tal como está
+              currentContext = `\n\nCONTEXTO DE LA CONVERSACIÓN:\n- El producto mencionado más recientemente es: ${productInfo}\n- Si el cliente responde "si", "sí", "ok", "agrégalo", etc., se refiere a este producto.`;
+            }
+            break; // Usar el producto más reciente encontrado
+          }
+        }
+      }
     }
-
-    const systemPromptHash = this.getSystemPromptHash(systemMessage);
+    
+    // Construir mensajes: cada mensaje del usuario incluye el system prompt
+    const messagesForAPI = conversationMessages.map(msg => {
+      if (msg.role === 'user') {
+        return {
+          role: 'user',
+          content: `${shortPrompt}\n\n${msg.content}`,
+        };
+      } else {
+        return {
+          role: 'assistant',
+          content: msg.content,
+        };
+      }
+    });
+    
+    // Agregar el mensaje actual del usuario con system prompt + contexto actual
+    messagesForAPI.push({
+      role: 'user',
+      content: `${shortPrompt}${currentContext}\n\n${userMessage}`,
+    });
+    
+    const systemPromptHash = this.getSystemPromptHash(shortPrompt);
 
     const requestOptions = {
       model: config.openai.model,
@@ -336,10 +609,6 @@ class OpenAIAgentService {
       tools: this.tools,
       tool_choice: 'auto',
     };
-
-    if (config.features.promptCaching) {
-      logger.info(`[OpenAI] Prompt caching enabled (hash: ${systemPromptHash.substring(0, 8)})`);
-    }
 
     return { requestOptions, messagesForAPI, systemPromptHash };
   }
@@ -368,11 +637,6 @@ class OpenAIAgentService {
       cached: usage.cached_tokens || 0,
       total: usage.total_tokens || 0,
     };
-
-    if (tokenData.cached > 0) {
-      const savings = ((tokenData.cached / (tokenData.input + tokenData.cached)) * 100).toFixed(1);
-      logger.info(`[OpenAI] 💰 Token savings: ${tokenData.cached} cached tokens (${savings}% reduction)`);
-    }
 
     return {
       message: parsedResponse.message || 'He encontrado información. ¿Puedo ayudarte con algo más?',

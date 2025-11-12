@@ -31,6 +31,7 @@ module.exports = {
   mongo: {
     uri: process.env.MONGO_URI,
     clientsUri: process.env.MONGO_URI_CLIENTS,
+    configUri: process.env.MONGO_URI_CONFIG, // Nueva conexión para configuración
     options: {
       maxPoolSize: 10,
       serverSelectionTimeoutMS: 5000,
@@ -54,10 +55,21 @@ module.exports = {
     maxTokens: parseInt(process.env.GEMINI_MAX_TOKENS, 10) || 1000,
   },
 
+  // Groq (LLM gratuito como fallback)
+  groq: {
+    apiKey: process.env.GROQ_API_KEY,
+    baseURL: process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1',
+    model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile', // Actualizado: llama-3.1-70b-versatile fue descomisionado
+    temperature: parseFloat(process.env.GROQ_TEMPERATURE || '0.3'),
+    maxTokens: parseInt(process.env.GROQ_MAX_TOKENS, 10) || 1000,
+    enabled: process.env.ENABLE_GROQ_FALLBACK === 'true', // Activar/desactivar Groq como fallback
+  },
+
   // Model Router
   router: {
-    defaultProvider: process.env.DEFAULT_MODEL_PROVIDER || 'auto',
+    defaultProvider: process.env.DEFAULT_MODEL_PROVIDER || 'auto', // 'auto' | 'gemini' | 'openai' | 'groq'
     enableFallback: process.env.ENABLE_MODEL_FALLBACK === 'true',
+    enableFreeFallback: process.env.ENABLE_FREE_LLM_FALLBACK === 'true', // Activar fallback a LLM gratuito
   },
 
   // JWT
@@ -103,6 +115,18 @@ module.exports = {
   security: {
     enableHelmet: process.env.ENABLE_HELMET !== 'false',
     enableRateLimit: process.env.ENABLE_RATE_LIMIT !== 'false',
+  },
+
+  // AWS (opcional - para text-to-speech)
+  aws: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    region: process.env.AWS_REGION || 'us-east-1',
+    polly: {
+      voiceId: process.env.AWS_POLLY_VOICE_ID || 'Mia',
+      languageCode: process.env.AWS_POLLY_LANGUAGE_CODE || 'es-MX',
+      engine: process.env.AWS_POLLY_ENGINE || 'neural',
+    },
   },
 };
 

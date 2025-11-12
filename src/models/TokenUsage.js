@@ -26,7 +26,7 @@ const tokenUsageSchema = new mongoose.Schema({
   },
   provider: {
     type: String,
-    enum: ['openai', 'gemini'],
+    enum: ['openai', 'gemini', 'groq'],
     required: true,
   },
   model: {
@@ -76,7 +76,7 @@ function calculateCost(provider, model, tokens) {
   // Precios por 1M tokens (actualizados 2024)
   const pricing = {
     openai: {
-      'gpt-4o-mini': {
+      'gpt-4o': {
         input: 2.50, // $2.50 por 1M tokens
         output: 10.00, // $10.00 por 1M tokens
         cached: 0.25, // $0.25 por 1M tokens (85% descuento)
@@ -99,13 +99,55 @@ function calculateCost(provider, model, tokens) {
         cached: 0,
       },
     },
+    groq: {
+      'llama-3.3-70b-versatile': {
+        input: 0, // Gratis (tier gratuito generoso) - Modelo actualizado
+        output: 0,
+        cached: 0,
+      },
+      'llama-3.1-70b-versatile': {
+        input: 0, // Descomisionado - mantener para compatibilidad
+        output: 0,
+        cached: 0,
+      },
+      'llama-3.1-8b-instant': {
+        input: 0, // Gratis
+        output: 0,
+        cached: 0,
+      },
+      'llama-3.3-8b-instant': {
+        input: 0, // Gratis - Modelo rápido actualizado
+        output: 0,
+        cached: 0,
+      },
+      'mixtral-8x7b-32768': {
+        input: 0, // Gratis
+        output: 0,
+        cached: 0,
+      },
+      'mixtral-8x22b-instruct': {
+        input: 0, // Gratis - Modelo Mixtral actualizado
+        output: 0,
+        cached: 0,
+      },
+    },
   };
 
   const providerPricing = pricing[provider]?.[model] || pricing.openai['gpt-4o'];
   
-  const inputCost = (tokens.input / 1000000) * providerPricing.input;
-  const outputCost = (tokens.output / 1000000) * providerPricing.output;
-  const cachedCost = (tokens.cached / 1000000) * providerPricing.cached;
+  // Validar que tokens existe y tiene la estructura correcta
+  if (!tokens || typeof tokens !== 'object') {
+    tokens = { input: 0, output: 0, thinking: 0, cached: 0, total: 0 };
+  }
+  
+  // Asegurar que todas las propiedades existen y son números (valores por defecto seguros)
+  const inputTokens = (typeof tokens.input === 'number' && !isNaN(tokens.input)) ? tokens.input : 0;
+  const outputTokens = (typeof tokens.output === 'number' && !isNaN(tokens.output)) ? tokens.output : 0;
+  const cachedTokens = (typeof tokens.cached === 'number' && !isNaN(tokens.cached)) ? tokens.cached : 0;
+  
+  const inputCost = (inputTokens / 1000000) * providerPricing.input;
+  const outputCost = (outputTokens / 1000000) * providerPricing.output;
+  const cachedCost = (cachedTokens / 1000000) * providerPricing.cached;
 
   return {
     input: inputCost,

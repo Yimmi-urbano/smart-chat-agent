@@ -4,13 +4,14 @@
  * ============================================
  * Orquesta la comunicación entre el router, los modelos
  * y la persistencia de conversaciones
- *
+ * 
  * MEJORA CLAVE: Memoriza el system prompt y lo mantiene
  * en el historial para evitar reenviarlo en cada mensaje
  */
 
 const GeminiAgentService = require('./gemini-agent.service');
 const OpenAIAgentService = require('./openai-agent.service');
+const GroqAgentService = require('./groq-agent.service');
 const ModelRouterService = require('./model-router.service');
 const PromptMemoryService = require('./prompt-memory.service');
 const IntentInterpreterService = require('./intent-interpreter.service');
@@ -26,21 +27,79 @@ class ChatOrchestratorService {
   constructor() {
     this.geminiService = new GeminiAgentService();
     this.openaiService = new OpenAIAgentService();
+    // Inicializar Groq solo si está habilitado y tiene API key
+    if (config.groq?.enabled && config.groq?.apiKey) {
+      this.groqService = new GroqAgentService();
+    } else {
+      this.groqService = null;
+    }
+  }
+
+  /**
+   * Detecta si un mensaje es una despedida
+   * @param {string} message - Mensaje del usuario
+   * @returns {boolean}
+   */
+  isFarewellMessage(message) {
+    if (!message || typeof message !== 'string') {
+      return false;
+    }
+
+    const farewellPatterns = [
+      /^(adiós|chao|bye|hasta luego|nos vemos|hasta pronto)$/i,
+      /^(me voy|ya me voy|me retiro|me despido)$/i,
+      /^(gracias por todo|fue un gusto|fue un placer)$/i,
+      /^(hasta la próxima|hasta después|nos vemos luego)$/i,
+      /^(que tengas.*día|que tengas.*tarde|que tengas.*noche)$/i,
+      /^(hasta.*adiós|chao.*nos vemos)$/i,
+    ];
+
+    const messageLower = message.toLowerCase().trim();
+    
+    // Verificar patrones exactos
+    if (farewellPatterns.some(pattern => pattern.test(messageLower))) {
+      return true;
+    }
+
+    // Verificar si contiene palabras clave de despedida
+    const farewellKeywords = [
+      'adiós', 'chao', 'bye', 'hasta luego', 'nos vemos', 
+      'hasta pronto', 'me voy', 'me retiro', 'me despido',
+      'gracias por todo', 'fue un gusto', 'fue un placer',
+      'hasta la próxima', 'que tengas buen día', 'que tengas buena tarde',
+      'que tengas buena noche'
+    ];
+
+    return farewellKeywords.some(keyword => messageLower.includes(keyword));
   }
 
   async processMessageStream({ userMessage, userId, domain, forceModel = null, res }) {
     const startTime = Date.now();
     const FILE_NAME = 'chat-orchestrator.service.js';
-    logger.info(`[${FILE_NAME}] 🔄 INICIANDO PROCESAMIENTO DE MENSAJE (STREAM)`);
+
+    // Configurar headers SSE ANTES de cualquier operación
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // Deshabilitar buffering de nginx
 
     let conversation;
     try {
         conversation = await this.getOrCreateConversation(userId, domain);
-        const { systemPrompt, history, interpretedIntent, toolResult, dynamicPrompt } = await this._prepareConversation(userMessage, conversation, domain);
-        const finalSystemPrompt = dynamicPrompt || systemPrompt;
+        const { history } = await this._prepareConversation(userMessage, conversation, domain);
 
-        const selectedModel = forceModel || ModelRouterService.decideModel(userMessage, history);
-        logger.info(`[${FILE_NAME}] [PASO 3/5] Modelo seleccionado para stream: ${selectedModel}`);
+        let selectedModel = forceModel || ModelRouterService.decideModel(userMessage, history);
+
+        // OPTIMIZACIÓN: Solo aplicar optimización automática si forceModel no fue especificado
+        // Si el usuario especifica forceModel explícitamente, respetar su elección
+        if (!forceModel || forceModel === 'auto') {
+            const message = userMessage.toLowerCase().trim();
+            const isProductSearch = ModelRouterService.detectsProductIntent(message);
+            if (selectedModel === 'groq' && isProductSearch) {
+                // Si es búsqueda de productos, usar Gemini directamente (más rápido)
+                selectedModel = 'gemini';
+            }
+        }
 
         let stream;
         let usagePromise = null;
@@ -49,13 +108,55 @@ class ChatOrchestratorService {
         let fallbackUsed = false;
 
         try {
-            if (selectedModel === 'gemini') {
+            if (selectedModel === 'groq') {
+                if (!this.groqService) {
+                    throw new Error('Groq service no está disponible. Configura GROQ_API_KEY y ENABLE_GROQ_FALLBACK=true');
+                }
+                // Groq no soporta streaming, usar respuesta normal y enviar completa
+                const groqResponse = await this.groqService.generateResponse(userMessage, history, domain, null);
+                usedModel = 'groq';
+                const toolsUsed = groqResponse.functionResults && groqResponse.functionResults.length > 0;
+                
+                // ENFOQUE: Function calling puro - La IA decide qué tools usar
+                // Confiamos completamente en la decisión de la IA, sin validación algorítmica
+                
+                // Enviar respuesta completa de una vez
+                if (!res.headersSent) {
+                    res.write(`data: ${JSON.stringify({ message: groqResponse.message })}\n\n`);
+                }
+                
+                // Continuar con la persistencia
+                const responseForPersistence = {
+                    message: groqResponse.message,
+                    usage: groqResponse.usage,
+                    usageMetadata: groqResponse.usageMetadata,
+                    functionResults: groqResponse.functionResults || [],
+                };
+                await this._finalizeAndPersistConversation({
+                    response: responseForPersistence,
+                    conversation,
+                    userMessage,
+                    history,
+                    interpretedIntent: { intent: toolsUsed ? 'tool_used' : 'general_chat', method: 'function_calling' },
+                    toolResult: null,
+                    toolResults: groqResponse.functionResults || [],
+                    systemPrompt: null,
+                    dynamicPrompt: null,
+                    usedModel: 'groq',
+                    thinkingUsed: false,
+                    fallbackUsed: false,
+                    domain,
+                    userId,
+                    startTime,
+                });
+                return;
+            } else if (selectedModel === 'gemini') {
                 thinkingUsed = ModelRouterService.shouldUseThinking(userMessage);
-                const geminiResult = await this.geminiService.generateResponseStream(userMessage, history, domain, finalSystemPrompt, thinkingUsed);
+                const geminiResult = await this.geminiService.generateResponseStream(userMessage, history, domain, null, thinkingUsed);
                 stream = geminiResult.stream;
                 usagePromise = geminiResult.usagePromise;
             } else {
-                stream = await this.openaiService.generateResponseStream(userMessage, history, domain, finalSystemPrompt);
+                stream = await this.openaiService.generateResponseStream(userMessage, history, domain, null);
             }
         } catch (error) {
             logger.error(`[${FILE_NAME}] ❌ Error inicial en stream con ${selectedModel}: ${error.message}`);
@@ -65,16 +166,69 @@ class ChatOrchestratorService {
                 logger.warn(`[${FILE_NAME}] Intentando fallback de stream a ${fallbackModel}...`);
                 if (fallbackModel === 'gemini') {
                     thinkingUsed = ModelRouterService.shouldUseThinking(userMessage);
-                    const geminiResult = await this.geminiService.generateResponseStream(userMessage, history, domain, finalSystemPrompt, thinkingUsed);
+                    const geminiResult = await this.geminiService.generateResponseStream(userMessage, history, domain, null, thinkingUsed);
                     stream = geminiResult.stream;
                     usagePromise = geminiResult.usagePromise;
                 } else {
-                    stream = await this.openaiService.generateResponseStream(userMessage, history, domain, finalSystemPrompt);
+                    stream = await this.openaiService.generateResponseStream(userMessage, history, domain, null);
                 }
                 usedModel = fallbackModel;
             } catch (fallbackError) {
                 logger.error(`[${FILE_NAME}] ❌ Fallback de stream también falló: ${fallbackError.message}`);
-                if (!res.headersSent) res.write('event: error\ndata: {"message": "Lo siento, estoy teniendo problemas técnicos."}\n\n');
+                
+                // Intentar fallback a LLM gratuito (Groq) si está habilitado
+                if (config.router.enableFreeFallback && this.groqService) {
+                    logger.warn(`[${FILE_NAME}] 🆓🆓🆓 INTENTANDO FALLBACK A LLM GRATUITO (Groq) EN STREAM...`);
+                    try {
+                    // Groq no soporta streaming directamente, usar respuesta normal
+                    const groqResponse = await this.groqService.generateResponse(userMessage, history, domain, null);
+                    const toolsUsed = groqResponse.functionResults && groqResponse.functionResults.length > 0;
+                    
+                    // ENFOQUE: Function calling puro - La IA decide qué tools usar
+                    // Confiamos completamente en la decisión de la IA, sin validación algorítmica
+                    
+                    // Enviar respuesta completa de una vez
+                    if (!res.headersSent) {
+                        res.write(`data: ${JSON.stringify({ message: groqResponse.message })}\n\n`);
+                    }
+                    usedModel = 'groq';
+                    
+                    // Continuar con la persistencia
+                    const responseForPersistence = {
+                        message: groqResponse.message,
+                        usage: groqResponse.usage,
+                        usageMetadata: groqResponse.usageMetadata,
+                        functionResults: groqResponse.functionResults || [],
+                    };
+                    await this._finalizeAndPersistConversation({
+                        response: responseForPersistence,
+                        conversation,
+                        userMessage,
+                        history,
+                        interpretedIntent: { intent: toolsUsed ? 'tool_used' : 'general_chat', method: 'function_calling' },
+                        toolResult: null,
+                        toolResults: groqResponse.functionResults || [],
+                        systemPrompt: null,
+                        dynamicPrompt: null,
+                        usedModel: 'groq',
+                        thinkingUsed: false,
+                        fallbackUsed: true,
+                        domain,
+                        userId,
+                        startTime,
+                    });
+                    return;
+                    } catch (groqError) {
+                        logger.error(`[${FILE_NAME}] ❌❌❌ FALLBACK GRATUITO EN STREAM TAMBIÉN FALLÓ: ${groqError.message}`);
+                        logger.error(`[${FILE_NAME}] ❌ Código de error de Groq: ${groqError.response?.status || groqError.status || 'N/A'}`);
+                        logger.error(`[${FILE_NAME}] ❌❌❌ TODOS LOS MODELOS FALLARON EN STREAM`);
+                    }
+                }
+                
+                // Si llegamos aquí, todos los modelos fallaron
+                if (!res.headersSent) {
+                    res.write('event: error\ndata: {"message": "Lo siento, estoy teniendo problemas técnicos."}\n\n');
+                }
                 return;
             }
         }
@@ -85,7 +239,6 @@ class ChatOrchestratorService {
         if (usedModel === 'openai') {
             for await (const chunk of stream) {
                 if (chunk.usage) {
-                    logger.info(`[${FILE_NAME}] Received usage data from OpenAI stream`, chunk.usage);
                     tokenData = {
                         input: chunk.usage.prompt_tokens || 0,
                         output: chunk.usage.completion_tokens || 0,
@@ -101,18 +254,32 @@ class ChatOrchestratorService {
             }
         } else { // Gemini
             for await (const chunk of stream) {
-                const content = chunk.text();
+                let content = '';
+                // Gemini puede devolver chunks de diferentes formas
+                if (typeof chunk.text === 'function') {
+                    content = chunk.text();
+                } else if (typeof chunk.text === 'string') {
+                    content = chunk.text;
+                } else if (chunk.candidates && chunk.candidates[0] && chunk.candidates[0].content) {
+                    // Formato alternativo de Gemini
+                    const parts = chunk.candidates[0].content.parts;
+                    if (parts && parts[0] && parts[0].text) {
+                        content = parts[0].text;
+                    }
+                }
                 if (content) {
                     fullResponseMessage += content;
                     res.write(`data: ${JSON.stringify({ message: content })}\n\n`);
                 }
             }
             if (usagePromise) {
-                tokenData = await usagePromise;
+                try {
+                    tokenData = await usagePromise;
+                } catch (error) {
+                    logger.error(`[${FILE_NAME}] Error obteniendo usage de Gemini: ${error.message}`);
+                }
             }
         }
-
-        logger.info(`[${FILE_NAME}] ✅ Stream finalizado. Respuesta completa: "${fullResponseMessage.substring(0, 100)}..."`);
 
         const responseForPersistence = {
             message: fullResponseMessage,
@@ -125,10 +292,11 @@ class ChatOrchestratorService {
             conversation,
             userMessage,
             history,
-            interpretedIntent,
-            toolResult,
-            systemPrompt,
-            dynamicPrompt,
+            interpretedIntent: { intent: 'general_chat', method: 'function_calling' },
+            toolResult: null,
+            toolResults: [],
+            systemPrompt: null,
+            dynamicPrompt: null,
             usedModel,
             thinkingUsed,
             fallbackUsed,
@@ -136,7 +304,6 @@ class ChatOrchestratorService {
             userId,
             startTime,
         });
-        logger.info(`[${FILE_NAME}] ✅ PROCESAMIENTO (STREAM) COMPLETADO en ${Date.now() - startTime}ms`);
 
     } catch (error) {
         logger.error(`[${FILE_NAME}] ❌ ERROR CRÍTICO en processMessageStream: ${error.message}`, { stack: error.stack });
@@ -153,51 +320,82 @@ class ChatOrchestratorService {
   async _prepareConversation(userMessage, conversation, domain) {
     const FILE_NAME = 'chat-orchestrator.service.js';
     try {
-        const systemPrompt = await PromptMemoryService.buildSystemPrompt(domain);
-        const history = this.getRecentHistory(conversation);
-        logger.info(`[${FILE_NAME}] [PASO 1/5] ✅ Preparación completa`);
+        // ENFOQUE: Function calling puro
+        // - System prompt SIEMPRE corto (solo instrucciones)
+        // - NO incluimos información de empresa/catálogo en el prompt
+        // - La IA obtiene TODO usando tools dinámicamente
+        // - Esto previene alucinaciones y asegura información actualizada
+        
+        let history = this.getRecentHistory(conversation);
 
-        logger.info(`[${FILE_NAME}] [PASO 2/5] INTERPRETACIÓN: Analizando intención...`);
-        let interpretedIntent = null;
-        let toolResult = null;
-        let dynamicPrompt = null;
-        try {
-            interpretedIntent = await IntentInterpreterService.interpret(userMessage, 'es', domain);
-            if (interpretedIntent.intent !== 'general_chat' && interpretedIntent.confidence >= 0.6) {
-                toolResult = await ToolExecutorService.executeTool(interpretedIntent.intent, interpretedIntent.params, domain);
-                if (toolResult) {
-                    dynamicPrompt = this.buildDynamicPrompt(interpretedIntent.intent, toolResult, systemPrompt, domain);
-                    logger.info(`[${FILE_NAME}] [PASO 2/5] ✅ Tool ejecutado: ${toolResult.tool}`);
-                }
-            }
-        } catch (error) {
-            logger.error(`[${FILE_NAME}] [PASO 2/5] ❌ Error en interpretación: ${error.message}`);
+        // Si es nueva sesión, agregar contexto para que la IA decida cómo saludar
+        if (conversation._isNewSession && history.length === 0) {
+          // Es el primer mensaje de una nueva sesión
+          const contextMessage = conversation._hasPreviousHistory
+            ? "CONTEXTO: El usuario está iniciando una nueva sesión de conversación. Este usuario ya ha tenido conversaciones previas en este sistema. Debes saludarlo con un mensaje de bienvenida de retorno, como 'Bienvenido nuevamente, estás de vuelta' o similar, de forma natural y amable."
+            : "CONTEXTO: El usuario está iniciando su primera conversación. Debes darle una bienvenida normal y amable como asistente de ventas.";
+          
+          // Agregar como mensaje de sistema al inicio del historial
+          history = [{
+            role: 'system',
+            content: contextMessage,
+          }];
         }
-        return { systemPrompt, history, interpretedIntent, toolResult, dynamicPrompt };
+
+        // NO construimos systemPrompt aquí, los agentes lo construirán dinámicamente
+        // usando buildShortSystemPrompt() que solo tiene instrucciones (sin datos)
+        return { systemPrompt: null, history, interpretedIntent: null, toolResult: null, dynamicPrompt: null };
     } catch (error) {
         logger.error(`[${FILE_NAME}] ❌ ERROR FATAL en _prepareConversation: ${error.message}`);
         throw new Error('No se pudo preparar la conversación: ' + error.message);
     }
   }
 
-  async _performFallback(originalModel, userMessage, history, domain, finalSystemPrompt) {
+  async _performFallback(originalModel, userMessage, history, domain, systemPrompt) {
     const FILE_NAME = 'chat-orchestrator.service.js';
     if (!config.router.enableFallback) {
+        logger.error(`[${FILE_NAME}] ❌ Fallback está deshabilitado en configuración`);
         throw new Error('Fallback is disabled.');
     }
     const fallbackModel = originalModel === 'gemini' ? 'openai' : 'gemini';
-    logger.warn(`[${FILE_NAME}] Intentando fallback a ${fallbackModel}...`);
+    logger.warn(`[${FILE_NAME}] 🔄 FALLBACK: Intentando responder con ${fallbackModel} (falló ${originalModel})...`);
     try {
         let response;
         if (fallbackModel === 'gemini') {
             const thinkingUsed = ModelRouterService.shouldUseThinking(userMessage);
-            response = await this.geminiService.generateResponse(userMessage, history, domain, finalSystemPrompt, thinkingUsed);
-        } else {
-            response = await this.openaiService.generateResponse(userMessage, history, domain, finalSystemPrompt);
+            response = await this.geminiService.generateResponse(userMessage, history, domain, null, thinkingUsed);
+          } else {
+            response = await this.openaiService.generateResponse(userMessage, history, domain, null);
         }
         return { response, usedModel: fallbackModel };
     } catch (fallbackError) {
-        logger.error(`[${FILE_NAME}] ❌ Fallback también falló: ${fallbackError.message}`);
+        logger.error(`[${FILE_NAME}] ❌❌❌ FALLBACK TAMBIÉN FALLÓ: ${fallbackError.message}`);
+        logger.error(`[${FILE_NAME}] ❌ Código de error del fallback: ${fallbackError.status || fallbackError.code || 'N/A'}`);
+        logger.error(`[${FILE_NAME}] ❌❌❌ AMBOS MODELOS (${originalModel} y ${fallbackModel}) FALLARON`);
+        
+        // Intentar fallback a LLM gratuito (Groq) si está habilitado
+        if (config.router.enableFreeFallback && this.groqService) {
+            logger.warn(`[${FILE_NAME}] 🆓🆓🆓 INTENTANDO FALLBACK A LLM GRATUITO (Groq)...`);
+            try {
+                const groqResponse = await this.groqService.generateResponse(userMessage, history, domain, null);
+                return { response: groqResponse, usedModel: 'groq' };
+            } catch (groqError) {
+                logger.error(`[${FILE_NAME}] ❌❌❌ FALLBACK GRATUITO TAMBIÉN FALLÓ: ${groqError.message}`);
+                logger.error(`[${FILE_NAME}] ❌ Código de error de Groq: ${groqError.response?.status || groqError.status || 'N/A'}`);
+                logger.error(`[${FILE_NAME}] ❌❌❌ TODOS LOS MODELOS (${originalModel}, ${fallbackModel} y groq) FALLARON`);
+          }
+        } else {
+            if (!config.router.enableFreeFallback) {
+                logger.warn(`[${FILE_NAME}] ⚠️ Fallback a LLM gratuito está deshabilitado (ENABLE_FREE_LLM_FALLBACK=false)`);
+            }
+            if (!this.groqService) {
+                logger.warn(`[${FILE_NAME}] ⚠️ Groq no está disponible (no configurado o deshabilitado)`);
+            }
+        }
+        
+        // Si llegamos aquí, todos los modelos fallaron
+        logger.error(`[${FILE_NAME}] ❌❌❌ TODOS LOS MODELOS FALLARON - Retornando respuesta de error`);
+        logger.warn(`[${FILE_NAME}] ⚠️⚠️⚠️ Retornando respuesta de error con usedModel='error_fallback' (NO es un éxito)`);
         return {
             response: {
                 message: 'Lo siento, estoy teniendo problemas técnicos en este momento. Por favor, intenta de nuevo en unos momentos.',
@@ -212,72 +410,405 @@ class ChatOrchestratorService {
 }
 
   async _finalizeAndPersistConversation({
-    response, conversation, userMessage, history, interpretedIntent, toolResult,
+    response, conversation, userMessage, history, interpretedIntent, toolResult, toolResults,
     systemPrompt, dynamicPrompt, usedModel, thinkingUsed, fallbackUsed,
     domain, userId, startTime,
   }) {
     const FILE_NAME = 'chat-orchestrator.service.js';
-    logger.info(`[${FILE_NAME}] [PASO 4/5 & 5/5] Finalizando y persistiendo...`);
 
-    const productResult = await this.findProductAnywhere({ toolResult, responseMessage: response.message, userMessage, history, conversation, domain });
+    // Validar que response existe
+    if (!response || typeof response !== 'object') {
+        logger.error(`[${FILE_NAME}] ❌ Response es inválido: ${JSON.stringify(response)}`);
+        response = {
+            message: 'Lo siento, estoy teniendo problemas técnicos en este momento. Por favor, intenta de nuevo en unos momentos.',
+            audio_description: 'Lo siento, estoy teniendo problemas técnicos.',
+            action: { type: 'none', productId: null, quantity: null, url: null, price_sale: null, title: null, price_regular: null, image: null, slug: null },
+            usage: { input: 0, output: 0, thinking: 0, cached: 0, total: 0 },
+            usageMetadata: { promptTokenCount: 0, candidatesTokenCount: 0, thinkingTokenCount: 0 },
+        };
+        usedModel = 'error_fallback';
+    }
+
+    // OPTIMIZACIÓN: Solo buscar productos si no hay toolResults (la IA ya los obtuvo)
+    // Si hay toolResults, usar esos productos directamente sin búsquedas adicionales en BD
+    let productResult = null;
+    if (toolResults && toolResults.length > 0) {
+        // La IA ya obtuvo productos de las herramientas - usar esos directamente
+        const firstToolResult = toolResults[0];
+        if (firstToolResult && firstToolResult.result) {
+            if (firstToolResult.result.products && firstToolResult.result.products.length > 0) {
+                productResult = { 
+                    product: firstToolResult.result.products[0], 
+                    source: 'toolResults' 
+                };
+            } else if (firstToolResult.result.id || firstToolResult.result.productId) {
+                productResult = { 
+                    product: firstToolResult.result, 
+                    source: 'toolResults' 
+                };
+            }
+        }
+    }
+    
+    // Solo buscar en BD si no hay toolResults (fallback)
+    if (!productResult) {
+        productResult = await this.findProductAnywhere({ toolResult, responseMessage: response.message, userMessage, history, conversation, domain });
+    }
+    
     if (productResult && productResult.product) {
         this.updateProductContext(conversation, productResult.product);
     }
 
-    let validatedAction = { type: 'none' };
-    const assistantMessage = (response.message || '').toLowerCase();
-    const isQuestion = assistantMessage.includes('?');
-    if (!isQuestion && toolResult && toolResult.tool === 'add_to_cart' && productResult) {
-        validatedAction = this.buildActionFromProduct(productResult.product);
-    } else if (response.action && response.action.type !== 'none') {
+    // ENFOQUE: La IA construye el action completo según el contexto
+    // El sistema solo valida y completa campos faltantes si es necesario, pero respeta la decisión de la IA
+    let validatedAction = { type: 'none', productId: null, quantity: null, url: null, price_sale: null, title: null, price_regular: null, image: null, slug: null };
+    
+    if (usedModel === 'error_fallback') {
+        // No construir acción para errores
+        validatedAction = { type: 'none', productId: null, quantity: null, url: null, price_sale: null, title: null, price_regular: null, image: null, slug: null };
+    } else if (response.action && response.action.type) {
+        // La IA construyó un action - validar y completar solo si es necesario
         validatedAction = this.sanitizeAction(response.action);
+        
+        // Si el action es add_to_cart pero le faltan datos, completar desde productResult
+        if (validatedAction.type === 'add_to_cart' && productResult && productResult.product) {
+            const product = productResult.product;
+            
+            // Completar campos faltantes desde el producto encontrado
+            if (!validatedAction.productId) validatedAction.productId = product.productId || product.id || product._id;
+            if (!validatedAction.title) validatedAction.title = product.title;
+            if (!validatedAction.slug) validatedAction.slug = product.slug;
+            if (!validatedAction.price_regular) validatedAction.price_regular = product.price?.regular || null;
+            if (!validatedAction.price_sale) validatedAction.price_sale = product.price?.sale || product.price?.regular || null;
+            if (!validatedAction.image) validatedAction.image = (product.image || (product.images && product.images[0]) || product.image_default) || null;
+            if (!validatedAction.url && validatedAction.slug) validatedAction.url = `/product/${validatedAction.slug}`;
+            if (!validatedAction.quantity) validatedAction.quantity = 1;
+        } else if (validatedAction.type === 'add_to_cart') {
+            // La IA quiere add_to_cart pero no hay producto en el contexto
+            // Validar que tenga al menos productId y title
+            if (!validatedAction.productId || !validatedAction.title) {
+                logger.warn(`[${FILE_NAME}] ⚠️ Acción add_to_cart incompleta (falta productId o title), cambiando a none`);
+                validatedAction = { type: 'none', productId: null, quantity: null, url: null, price_sale: null, title: null, price_regular: null, image: null, slug: null };
+            }
+        }
+    } else {
+        // La IA no incluyó action o está vacío - usar none por defecto
+        validatedAction = { type: 'none', productId: null, quantity: null, url: null, price_sale: null, title: null, price_regular: null, image: null, slug: null };
+    }
+    
+    // Validar que el mensaje incluya una pregunta (embudo de compra)
+    // EXCEPCIÓN: No validar si el usuario se está despidiendo
+    const assistantMessage = response.message || '';
+    const hasQuestion = assistantMessage.includes('?');
+    const isFarewell = this.isFarewellMessage(userMessage);
+    
+    if (!hasQuestion && usedModel !== 'error_fallback' && !isFarewell) {
+        logger.warn(`[${FILE_NAME}] ⚠️ La respuesta no incluye una pregunta - debería incluir una para mantener el embudo de compra`);
+    } else if (isFarewell && !hasQuestion) {
+        logger.info(`[${FILE_NAME}] ✓ Respuesta de despedida detectada - no se requiere pregunta`);
     }
 
-    const tokenData = {
-        input: response.usage?.input || response.usageMetadata?.promptTokenCount || 0,
-        output: response.usage?.output || response.usageMetadata?.candidatesTokenCount || 0,
-        thinking: response.usage?.thinking || response.usageMetadata?.thinkingTokenCount || 0,
-        cached: response.usage?.cached || 0,
+    // Si el usuario se despidió, marcar la conversación como closed después de responder
+    if (isFarewell && conversation && !conversation.isInMemory) {
+        // Marcar para cerrar después de guardar los mensajes
+        conversation._shouldCloseAfterSave = true;
+    }
+
+    // Construir tokenData con valores por defecto seguros
+    // IMPORTANTE: Asegurar que tokenData siempre tenga la estructura correcta
+    let tokenData = {
+        input: 0,
+        output: 0,
+        thinking: 0,
+        cached: 0,
         total: 0,
     };
-    tokenData.total = tokenData.input + tokenData.output + tokenData.thinking;
 
-    const cost = getTokenUsageModel.calculateCost(
-        usedModel === 'error_fallback' ? 'openai' : usedModel,
-        usedModel === 'gemini' ? config.gemini.model : config.openai.model,
-        tokenData
-    );
+    try {
+        // Intentar extraer datos de usage
+        if (response && response.usage && typeof response.usage === 'object') {
+            tokenData.input = (typeof response.usage.input === 'number' && !isNaN(response.usage.input)) ? response.usage.input : 0;
+            tokenData.output = (typeof response.usage.output === 'number' && !isNaN(response.usage.output)) ? response.usage.output : 0;
+            tokenData.thinking = (typeof response.usage.thinking === 'number' && !isNaN(response.usage.thinking)) ? response.usage.thinking : 0;
+            tokenData.cached = (typeof response.usage.cached === 'number' && !isNaN(response.usage.cached)) ? response.usage.cached : 0;
+        }
+        
+        // Intentar extraer datos de usageMetadata si usage no tiene datos
+        if ((tokenData.input === 0 && tokenData.output === 0) && response && response.usageMetadata && typeof response.usageMetadata === 'object') {
+            tokenData.input = (typeof response.usageMetadata.promptTokenCount === 'number' && !isNaN(response.usageMetadata.promptTokenCount)) ? response.usageMetadata.promptTokenCount : 0;
+            tokenData.output = (typeof response.usageMetadata.candidatesTokenCount === 'number' && !isNaN(response.usageMetadata.candidatesTokenCount)) ? response.usageMetadata.candidatesTokenCount : 0;
+            tokenData.thinking = (typeof response.usageMetadata.thinkingTokenCount === 'number' && !isNaN(response.usageMetadata.thinkingTokenCount)) ? response.usageMetadata.thinkingTokenCount : 0;
+        }
+        
+        tokenData.total = tokenData.input + tokenData.output + tokenData.thinking;
+    } catch (error) {
+        logger.error(`[${FILE_NAME}] ❌ Error construyendo tokenData: ${error.message}`);
+        // Asegurar valores por defecto
+        tokenData = { input: 0, output: 0, thinking: 0, cached: 0, total: 0 };
+    }
+
+    // Validación final: asegurar que todas las propiedades son números válidos
+    if (!tokenData || typeof tokenData !== 'object' || 
+        typeof tokenData.input !== 'number' || isNaN(tokenData.input) ||
+        typeof tokenData.output !== 'number' || isNaN(tokenData.output)) {
+        logger.warn(`[${FILE_NAME}] ⚠️ tokenData inválido después de construcción, usando valores por defecto. Response: ${JSON.stringify(response?.usage || response?.usageMetadata || 'no usage data')}`);
+        tokenData = { input: 0, output: 0, thinking: 0, cached: 0, total: 0 };
+    }
+
+    // Calcular costo de forma segura
+    // IMPORTANTE: Si usedModel es 'error_fallback', no calcular costo (no hubo llamada real a API)
+    let cost;
+    if (usedModel === 'error_fallback') {
+        // No calcular costo si ambos modelos fallaron
+        cost = { input: 0, output: 0, cached: 0, thinking: 0, total: 0, currency: 'USD' };
+    } else {
+        try {
+            const TokenUsage = getTokenUsageModel();
+            const modelName = usedModel === 'gemini' ? config.gemini.model : 
+                            usedModel === 'groq' ? config.groq.model : 
+                            config.openai.model;
+            cost = TokenUsage.calculateCost(usedModel, modelName, tokenData);
+        } catch (costError) {
+            logger.error(`[${FILE_NAME}] ❌ Error calculando costo: ${costError.message}`);
+            // Costo por defecto
+            cost = { input: 0, output: 0, cached: 0, thinking: 0, total: 0, currency: 'USD' };
+        }
+    }
 
     conversation.messages.push({ role: 'user', content: userMessage, timestamp: new Date() });
 
-    const promptFull = dynamicPrompt || systemPrompt;
+    // Preparar metadata con auditoría completa
+    const promptFull = dynamicPrompt || systemPrompt || '';
+    let promptType = 'system';
+    if (dynamicPrompt) {
+        promptType = 'system+dynamic';
+    } else if (systemPrompt) {
+        const shortPrompt = PromptMemoryService.buildShortSystemPrompt(domain);
+        const shortPromptLength = shortPrompt.length;
+        if (systemPrompt.length <= shortPromptLength * 1.5 && systemPrompt.length >= shortPromptLength * 0.8) {
+            promptType = 'short';
+        } else {
+            promptType = 'system';
+        }
+    }
+    const promptHashForAudit = systemPrompt ? crypto.createHash('md5').update(systemPrompt).digest('hex').substring(0, 8) : null;
+
+    const assistantMetadata = {
+          model: usedModel,
+          tokens: tokenData,
+        thinkingUsed: thinkingUsed || false,
+          cachedTokens: tokenData.cached,
+          action: validatedAction,
+        prompt: promptFull,
+        promptType: promptType,
+        promptLength: promptFull.length,
+        systemPromptHash: promptHashForAudit,
+        intent_interpreted: interpretedIntent,
+        tool_executed: toolResult,
+    };
+
+    // MEJORA: Extraer información de productos de functionResults para incluir en el historial
+    // Esto permite que la IA tenga contexto de productos mencionados en mensajes anteriores
+    const mentionedProducts = [];
+    
+    // Asegurar que toolResults esté definido (puede ser undefined si no se pasó)
+    const safeToolResults = toolResults || [];
+    
+    // Extraer productos de functionResults (resultados de herramientas)
+    if (safeToolResults && Array.isArray(safeToolResults) && safeToolResults.length > 0) {
+        for (const toolResult of safeToolResults) {
+            if (toolResult.result && toolResult.result.products && Array.isArray(toolResult.result.products)) {
+                // Múltiples productos (búsqueda)
+                for (const product of toolResult.result.products) {
+                    if (product.id || product._id) {
+                        mentionedProducts.push({
+                            productId: product.id || product._id,
+                            slug: product.slug || null,
+                            title: product.title || null,
+                        });
+                    }
+                }
+            } else if (toolResult.result && (toolResult.result.id || toolResult.result._id || toolResult.result.productId)) {
+                // Producto individual (detalles, precio)
+                mentionedProducts.push({
+                    productId: toolResult.result.id || toolResult.result._id || toolResult.result.productId,
+                    slug: toolResult.result.slug || null,
+                    title: toolResult.result.title || null,
+                });
+            }
+        }
+    }
+    
+    // Extraer productos de toolResult (formato antiguo)
+    if (toolResult && toolResult.data) {
+        if (toolResult.data.products && Array.isArray(toolResult.data.products)) {
+            for (const product of toolResult.data.products) {
+                if (product.id || product._id) {
+                    mentionedProducts.push({
+                        productId: product.id || product._id,
+                        slug: product.slug || null,
+                        title: product.title || null,
+                    });
+                }
+            }
+        } else if (toolResult.data.productId || toolResult.data.id || toolResult.data._id) {
+            mentionedProducts.push({
+                productId: toolResult.data.productId || toolResult.data.id || toolResult.data._id,
+                slug: toolResult.data.slug || null,
+                title: toolResult.data.title || null,
+            });
+        }
+    }
+    
+    // Eliminar duplicados por productId
+    const uniqueProducts = mentionedProducts.filter((product, index, self) => 
+        index === self.findIndex(p => p.productId === product.productId)
+    );
+    
+    // Guardar información de productos en metadata
+    if (uniqueProducts.length > 0) {
+        assistantMetadata.mentionedProducts = uniqueProducts;
+        assistantMetadata.lastProductShown = uniqueProducts[0]; // Primer producto para compatibilidad
+    }
+    
+    // Si hay acción validada, agregar ese producto también
+    if (validatedAction && validatedAction.type !== 'none' && validatedAction.productId && validatedAction.title) {
+        const actionProduct = {
+            productId: validatedAction.productId,
+            slug: validatedAction.slug || null,
+            title: validatedAction.title || null,
+        };
+        
+        // Agregar si no existe ya
+        if (!uniqueProducts.find(p => p.productId === actionProduct.productId)) {
+            if (!assistantMetadata.mentionedProducts) {
+                assistantMetadata.mentionedProducts = [];
+            }
+            assistantMetadata.mentionedProducts.push(actionProduct);
+        }
+        
+        if (!assistantMetadata.lastProductShown) {
+            assistantMetadata.lastProductShown = actionProduct;
+        }
+    }
+
+    // MEJORA: Enriquecer el contenido del mensaje del asistente con información de productos mencionados
+    // Esto permite que la IA tenga contexto de productos en mensajes siguientes
+    // IMPORTANTE: Limpiar el mensaje de la IA (remover [CONTEXTO_PRODUCTOS] si la IA lo incluyó)
+    let cleanMessage = (response.message || '').replace(/\[CONTEXTO_PRODUCTOS:[^\]]+\]/g, '').trim();
+    
+    let enrichedContent = cleanMessage;
+    if (uniqueProducts.length > 0) {
+        // Agregar información estructurada de productos al final del mensaje
+        // La IA podrá referenciar estos productos en mensajes siguientes
+        const productsInfo = uniqueProducts.map(p => 
+            `${p.title || 'Producto'} (ID: ${p.productId}${p.slug ? `, slug: ${p.slug}` : ''})`
+        ).join('; ');
+        
+        // Agregar nota contextual al final del mensaje (no visible para el usuario, pero útil para la IA)
+        enrichedContent += `\n\n[CONTEXTO_PRODUCTOS: ${productsInfo}]`;
+    }
+
     conversation.messages.push({
         role: 'assistant',
-        content: response.message,
+        content: enrichedContent, // Usar contenido enriquecido en el historial (con contexto)
         timestamp: new Date(),
-        metadata: { model: usedModel, tokens: tokenData, action: validatedAction, promptLength: promptFull.length, thinkingUsed, fallbackUsed, intent_interpreted: interpretedIntent, tool_executed: toolResult },
+        metadata: assistantMetadata,
     });
 
+    // Asegurar que metadata existe (para conversaciones en memoria)
+    if (!conversation.metadata) {
+        conversation.metadata = {
+            totalMessages: 0,
+            totalTokens: 0,
+            cachedTokens: 0,
+            modelsUsed: { gemini: 0, openai: 0, groq: 0 },
+            averageResponseTime: 0,
+        };
+    }
+
+    // Actualizar metadata de conversación (completo)
     conversation.metadata.totalMessages = (conversation.metadata.totalMessages || 0) + 2;
     conversation.metadata.totalTokens = (conversation.metadata.totalTokens || 0) + tokenData.total;
-    await conversation.save();
+    conversation.metadata.cachedTokens = (conversation.metadata.cachedTokens || 0) + tokenData.cached;
+    conversation.metadata.modelsUsed = conversation.metadata.modelsUsed || { gemini: 0, openai: 0, groq: 0 };
+    conversation.metadata.modelsUsed[usedModel] = (conversation.metadata.modelsUsed[usedModel] || 0) + 1;
 
-    const responseTime = Date.now() - startTime;
-    await getTokenUsageModel().create({
-        domain, userId, conversationId: conversation._id, provider: usedModel,
-        model: usedModel === 'gemini' ? config.gemini.model : config.openai.model,
-        tokens: tokenData, cost, metadata: { responseTime, fallbackUsed },
+      const responseTime = Date.now() - startTime;
+      conversation.metadata.averageResponseTime = 
+        (conversation.metadata.averageResponseTime + responseTime) / 2;
+
+    // Guardar conversación con manejo de errores de MongoDB
+    // OPTIMIZACIÓN: Persistencia asíncrona (no bloquear la respuesta)
+    // Guardar en background para reducir tiempo de respuesta en 200-1000ms
+    setImmediate(async () => {
+        try {
+            // Guardar conversación con manejo de errores de MongoDB
+            if (!conversation.isInMemory) {
+                await conversation.save();
+                
+                // Si el usuario se despidió, cerrar la conversación
+                if (conversation._shouldCloseAfterSave) {
+                    const Conversation = getConversationModel();
+                    await Conversation.findByIdAndUpdate(conversation._id, {
+                        status: 'closed',
+                    });
+                    logger.info(`[${FILE_NAME}] ✓ Conversación ${conversation._id} cerrada por despedida del usuario`);
+                }
+            } else {
+                logger.warn(`[${FILE_NAME}] ⚠️ Conversación en memoria, no se guarda en MongoDB`);
+            }
+        } catch (saveError) {
+            logger.error(`[${FILE_NAME}] ❌ Error guardando conversación (async): ${saveError.message}`);
+        }
+
+        // Guardar métricas de tokens (no crítico si falla)
+        try {
+            const isValidProvider = usedModel === 'gemini' || usedModel === 'openai' || usedModel === 'groq';
+            const hasValidConversationId = conversation._id && !conversation.isInMemory;
+            
+            if (hasValidConversationId && isValidProvider) {
+                const TokenUsage = getTokenUsageModel();
+                const modelName = usedModel === 'gemini' ? config.gemini.model : 
+                                usedModel === 'groq' ? config.groq.model : 
+                                config.openai.model;
+                const tokenUsageData = {
+                    domain,
+                    userId,
+                    conversationId: conversation._id,
+                    provider: usedModel,
+                    model: modelName,
+                    tokens: tokenData,
+                    cost,
+                    metadata: {
+                        responseTime,
+                        fallbackUsed,
+                        thinkingUsed: thinkingUsed || false,
+                    },
+                };
+                
+                await TokenUsage.create(tokenUsageData);
+            }
+        } catch (tokenError) {
+            logger.error(`[${FILE_NAME}] ❌ Error guardando métricas de tokens (async): ${tokenError.message}`);
+            if (tokenError.name === 'ValidationError') {
+                logger.error(`[${FILE_NAME}] ❌ Error de validación: ${JSON.stringify(tokenError.errors || {})}`);
+            }
+        }
     });
 
-    return {
-        message: response.message,
-        audio_description: response.audio_description,
+      // Limpiar el mensaje antes de devolverlo al usuario (remover [CONTEXTO_PRODUCTOS])
+      const cleanMessageForUser = (response.message || '').replace(/\[CONTEXTO_PRODUCTOS:[^\]]+\]/g, '').trim();
+      
+      return {
+        message: cleanMessageForUser, // Mensaje limpio sin [CONTEXTO_PRODUCTOS]
+        audio_description: response.audio_description || cleanMessageForUser,
         action: validatedAction,
         model_used: usedModel,
         tokens: tokenData,
         cost,
         response_time_ms: responseTime,
-        conversation_id: conversation._id,
+        conversation_id: conversation._id || null, // Puede ser null si es conversación en memoria
         thinking_used: thinkingUsed,
         fallback_used: fallbackUsed,
         intent_interpreted: interpretedIntent,
@@ -296,38 +827,42 @@ class ChatOrchestratorService {
     if (toolResult && toolResult.data) {
       if (toolResult.data.products && toolResult.data.products.length > 0) {
         const product = toolResult.data.products[0];
-        logger.info(`[${FILE_NAME}] findProductAnywhere() - ✅ Producto encontrado en toolResult: ${product.title}`);
         return { product, source: 'toolResult' };
       } else if (toolResult.data.productId || toolResult.data.id) {
-        logger.info(`[${FILE_NAME}] findProductAnywhere() - ✅ Producto encontrado en toolResult: ${toolResult.data.title}`);
         return { product: toolResult.data, source: 'toolResult' };
       }
     }
 
-    // PRIORIDAD 2: Producto del mensaje del asistente
+    // OPTIMIZACIÓN: Solo buscar en BD si es realmente necesario (último recurso)
+    // Las búsquedas en BD son lentas, preferir usar contexto de conversación
+    
+    // PRIORIDAD 2: Producto del contexto persistente (rápido, sin BD)
+    const productInHistory = this.findProductInHistory(history, conversation);
+    if (productInHistory && productInHistory.fullData) {
+      return { product: productInHistory.fullData, source: 'conversation_context' };
+    }
+
+    // PRIORIDAD 3: Búsquedas en BD solo si no hay contexto (LENTO - evitar si es posible)
+    // Estas búsquedas pueden tardar 500ms-2000ms cada una
+    // Solo hacer si realmente es necesario
+    
+    // Comentado para optimizar - las búsquedas en BD son muy lentas
+    // Si la IA no obtuvo productos de las herramientas, probablemente no hay producto relevante
+    /*
     if (responseMessage && responseMessage.length > 10) {
       const extracted = await this.extractProductFromMessage(responseMessage, domain);
       if (extracted) {
-        logger.info(`[${FILE_NAME}] findProductAnywhere() - ✅ Producto extraído del mensaje asistente: ${extracted.title}`);
         return { product: extracted, source: 'assistant_message' };
       }
     }
 
-    // PRIORIDAD 3: Producto del mensaje del usuario
     if (userMessage && userMessage.length > 5) {
       const extracted = await this.findProductByNameInMessage(userMessage, domain);
       if (extracted) {
-        logger.info(`[${FILE_NAME}] findProductAnywhere() - ✅ Producto extraído del mensaje usuario: ${extracted.title}`);
         return { product: extracted, source: 'user_message' };
       }
     }
-
-    // PRIORIDAD 4: Producto del contexto persistente (último recurso)
-    const productInHistory = this.findProductInHistory(history, conversation);
-    if (productInHistory && productInHistory.fullData) {
-      logger.info(`[${FILE_NAME}] findProductAnywhere() - ✅ Producto encontrado en contexto: ${productInHistory.fullData.title}`);
-      return { product: productInHistory.fullData, source: 'conversation_context' };
-    }
+    */
 
     return null;
   }
@@ -361,36 +896,108 @@ class ChatOrchestratorService {
   async processMessage({ userMessage, userId, domain, forceModel = null }) {
     const startTime = Date.now();
     const FILE_NAME = 'chat-orchestrator.service.js';
-    logger.info(`[${FILE_NAME}] 🔄 INICIANDO PROCESAMIENTO DE MENSAJE (NO-STREAM)`);
 
     try {
         let conversation = await this.getOrCreateConversation(userId, domain);
-        const { systemPrompt, history, interpretedIntent, toolResult, dynamicPrompt } = await this._prepareConversation(userMessage, conversation, domain);
-        const finalSystemPrompt = dynamicPrompt || systemPrompt;
+        const { history } = await this._prepareConversation(userMessage, conversation, domain);
 
         let response;
         let usedModel;
         let thinkingUsed = false;
         let fallbackUsed = false;
+        let toolsUsed = false;
+        let toolResults = [];
 
-        const selectedModel = forceModel || ModelRouterService.decideModel(userMessage, history);
-        logger.info(`[${FILE_NAME}] [PASO 3/5] Modelo seleccionado: ${selectedModel}`);
+        let selectedModel = forceModel || ModelRouterService.decideModel(userMessage, history);
 
         try {
-            if (selectedModel === 'gemini') {
-                thinkingUsed = ModelRouterService.shouldUseThinking(userMessage);
-                response = await this.geminiService.generateResponse(userMessage, history, domain, finalSystemPrompt, thinkingUsed);
-                usedModel = 'gemini';
-            } else {
-                response = await this.openaiService.generateResponse(userMessage, history, domain, finalSystemPrompt);
-                usedModel = 'openai';
+            // OPTIMIZACIÓN: Usar Gemini directamente para búsquedas de productos (más rápido)
+            // PERO: Solo aplicar si forceModel no fue especificado (es null o "auto")
+            // Si el usuario especifica forceModel explícitamente, respetar su elección
+            if (!forceModel || forceModel === 'auto') {
+                const message = userMessage.toLowerCase().trim();
+                const isProductSearch = ModelRouterService.detectsProductIntent(message);
+                if (selectedModel === 'groq' && isProductSearch) {
+                    // Si es búsqueda de productos, usar Gemini directamente (más rápido)
+                    selectedModel = 'gemini';
+                }
             }
-        } catch (error) {
-            logger.error(`[${FILE_NAME}] ❌ Error inicial con ${selectedModel}: ${error.message}`);
+            
+            if (selectedModel === 'groq') {
+                if (!this.groqService) {
+                    throw new Error('Groq service no está disponible. Configura GROQ_API_KEY y ENABLE_GROQ_FALLBACK=true');
+                }
+                response = await this.groqService.generateResponse(userMessage, history, domain, null);
+                usedModel = 'groq';
+                // Groq también tiene function calling, verificar si usó tools
+                toolsUsed = response.functionResults && response.functionResults.length > 0;
+                toolResults = response.functionResults || [];
+            } else if (selectedModel === 'gemini') {
+                thinkingUsed = ModelRouterService.shouldUseThinking(userMessage);
+                response = await this.geminiService.generateResponse(userMessage, history, domain, null, thinkingUsed);
+                usedModel = 'gemini';
+                // Gemini retorna functionResults si usó tools
+                toolsUsed = response.functionResults && response.functionResults.length > 0;
+                toolResults = response.functionResults || [];
+            } else {
+                response = await this.openaiService.generateResponse(userMessage, history, domain, null);
+                usedModel = 'openai';
+                // OpenAI retorna functionResults si usó tools
+                toolsUsed = response.functionResults && response.functionResults.length > 0;
+                toolResults = response.functionResults || [];
+            }
+    } catch (error) {
+            logger.error(`[${FILE_NAME}] ❌❌❌ Error inicial con ${selectedModel}: ${error.message}`);
+            logger.error(`[${FILE_NAME}] ❌ Código de error: ${error.status || error.code || 'N/A'}`);
             fallbackUsed = true;
-            const fallbackResponse = await this._performFallback(selectedModel, userMessage, history, domain, finalSystemPrompt);
-            response = fallbackResponse.response;
-            usedModel = fallbackResponse.usedModel;
+            try {
+                const fallbackResponse = await this._performFallback(selectedModel, userMessage, history, domain, null);
+                response = fallbackResponse.response;
+                usedModel = fallbackResponse.usedModel;
+                toolsUsed = response.functionResults && response.functionResults.length > 0;
+                toolResults = response.functionResults || [];
+                // Solo loggear como exitoso si realmente fue exitoso (no error_fallback)
+                if (usedModel === 'error_fallback') {
+                    logger.warn(`[${FILE_NAME}] ⚠️⚠️⚠️ Fallback retornó error_fallback (ambos modelos fallaron)`);
+                }
+            } catch (fallbackError) {
+                logger.error(`[${FILE_NAME}] ❌❌❌ Error en fallback: ${fallbackError.message}`);
+                logger.error(`[${FILE_NAME}] ❌❌❌ AMBOS MODELOS FALLARON - Usando respuesta de error`);
+                // Si el fallback falla o está deshabilitado, usar respuesta de error
+                response = {
+                    message: 'Lo siento, estoy teniendo problemas técnicos en este momento. Por favor, intenta de nuevo en unos momentos.',
+                    audio_description: 'Lo siento, estoy teniendo problemas técnicos.',
+                    action: { type: 'none', productId: null, quantity: null, url: null, price_sale: null, title: null, price_regular: null, image: null, slug: null },
+                    usage: { input: 0, output: 0, thinking: 0, cached: 0, total: 0 },
+                    usageMetadata: { promptTokenCount: 0, candidatesTokenCount: 0, thinkingTokenCount: 0 },
+                    functionResults: [],
+                };
+                usedModel = 'error_fallback';
+                toolsUsed = false;
+                toolResults = [];
+                logger.warn(`[${FILE_NAME}] ⚠️ Usando respuesta de error (usedModel: error_fallback)`);
+            }
+        }
+
+        // ENFOQUE: Function calling puro - La IA decide qué tools usar
+        // Confiamos completamente en la decisión de la IA mediante function calling nativo
+        // No usamos validación algorítmica con palabras clave
+        // Si la IA no usa tools cuando debería, debemos mejorar el prompt, no forzarlo con algoritmos
+
+        // Log del estado final antes de persistir
+        if (usedModel === 'error_fallback') {
+            logger.warn(`[${FILE_NAME}] ⚠️⚠️⚠️ ESTADO FINAL: Error fallback activado (ningún modelo respondió)`);
+        }
+
+        // Preparar toolResult para compatibilidad con _finalizeAndPersistConversation
+        let toolResult = null;
+        if (toolResults && toolResults.length > 0) {
+            // Tomar el primer tool result para compatibilidad
+            const firstToolResult = toolResults[0];
+            toolResult = {
+                tool: firstToolResult.functionName || 'unknown',
+                data: firstToolResult.result || firstToolResult,
+            };
         }
 
         const finalResponse = await this._finalizeAndPersistConversation({
@@ -398,10 +1005,11 @@ class ChatOrchestratorService {
             conversation,
             userMessage,
             history,
-            interpretedIntent,
+            interpretedIntent: { intent: toolsUsed ? 'tool_used' : 'general_chat', method: 'function_calling' },
             toolResult,
-            systemPrompt,
-            dynamicPrompt,
+            toolResults: toolResults || [],
+            systemPrompt: null,
+            dynamicPrompt: null,
             usedModel,
             thinkingUsed,
             fallbackUsed,
@@ -410,49 +1018,145 @@ class ChatOrchestratorService {
             startTime,
         });
 
-        logger.info(`[${FILE_NAME}] ✅ PROCESAMIENTO (NO-STREAM) COMPLETADO en ${Date.now() - startTime}ms`);
         return finalResponse;
 
     } catch (error) {
         logger.error(`[${FILE_NAME}] ❌ ERROR CRÍTICO en processMessage: ${error.message}`, { stack: error.stack });
-        throw error;
+      throw error;
     }
   }
 
   /**
    * Obtiene o crea una conversación
+   * Detecta nueva sesión si pasaron más de 15 minutos o hubo despedida previa
    */
   async getOrCreateConversation(userId, domain) {
+    const FILE_NAME = 'chat-orchestrator.service.js';
     const Conversation = getConversationModel();
+    
+    try {
+    // OPTIMIZACIÓN MULTITENANT: Usar select() para limitar campos y mejorar performance
+    // No usar lean() aquí porque necesitamos el documento Mongoose para .save() después
     let conversation = await Conversation.findOne({
       userId,
       domain,
       status: 'active',
-    }).sort({ updatedAt: -1 });
+    })
+    .select('userId domain status messages metadata updatedAt')
+    .sort({ updatedAt: -1 });
 
+    let isNewSession = false;
+    let hasPreviousHistory = false;
+
+    if (conversation) {
+      // Verificar si debe ser nueva sesión
+      const now = new Date();
+      const lastUpdate = new Date(conversation.updatedAt);
+      const minutesSinceLastMessage = (now - lastUpdate) / (1000 * 60);
+
+      // Verificar si el último mensaje fue una despedida
+      const messages = conversation.messages || [];
+      let lastMessageWasFarewell = false;
+      
+      if (messages.length > 0) {
+        const lastMessage = messages[messages.length - 1];
+        // Verificar si el último mensaje del usuario o asistente fue una despedida
+        if (lastMessage.role === 'user') {
+          lastMessageWasFarewell = this.isFarewellMessage(lastMessage.content);
+        } else if (lastMessage.role === 'assistant') {
+          // Detectar despedidas del asistente (patrones comunes)
+          const assistantMessage = lastMessage.content.toLowerCase();
+          const farewellPatterns = [
+            /hasta luego/i, /hasta pronto/i, /nos vemos/i, /que tengas/i,
+            /fue un gusto/i, /fue un placer/i, /adiós/i, /chao/i, /bye/i,
+            /excelente día/i, /buen día/i, /buena tarde/i, /buena noche/i
+          ];
+          lastMessageWasFarewell = farewellPatterns.some(pattern => pattern.test(assistantMessage));
+        }
+      }
+
+      // Nueva sesión si: pasaron más de 15 minutos O hubo despedida previa
+      if (minutesSinceLastMessage > 15 || lastMessageWasFarewell) {
+        isNewSession = true;
+        // Cerrar la conversación anterior
+        await Conversation.findByIdAndUpdate(conversation._id, {
+          status: 'closed',
+        });
+        conversation = null; // Forzar creación de nueva conversación
+      } else {
+        // Asegurarse de que messages esté inicializado
+        if (!conversation.messages) {
+          conversation.messages = [];
+        }
+      }
+    }
+
+    // Si no hay conversación activa, verificar si el usuario tiene historial previo
     if (!conversation) {
+      // Verificar si el usuario tiene historial previo (cualquier conversación, activa o cerrada)
+      const previousConversations = await Conversation.countDocuments({
+        userId,
+        domain,
+      });
+      hasPreviousHistory = previousConversations > 0;
+      isNewSession = true;
+
+      // Crear nueva conversación
       conversation = await Conversation.create({
         userId,
         domain,
         messages: [],
         status: 'active',
+        metadata: {
+          isNewSession: true,
+          hasPreviousHistory: hasPreviousHistory,
+        },
       });
-      logger.info(`[Orchestrator] Created new conversation for user ${userId}`);
     } else {
-      // Asegurarse de que messages esté inicializado
-      if (!conversation.messages) {
-        conversation.messages = [];
+      // Si es conversación existente, actualizar metadata si es necesario
+      if (!conversation.metadata) {
+        conversation.metadata = {};
       }
-      logger.info(`[Orchestrator] Found existing conversation with ${conversation.messages.length} messages`);
+      conversation.metadata.isNewSession = false;
+      conversation.metadata.hasPreviousHistory = false; // Ya está en conversación activa
     }
 
+    // Agregar flags a la conversación para que la IA los use
+    conversation._isNewSession = isNewSession;
+    conversation._hasPreviousHistory = hasPreviousHistory;
+
     return conversation;
+    } catch (error) {
+      logger.error(`[${FILE_NAME}] ❌ Error en getOrCreateConversation: ${error.message}`);
+      // Si MongoDB falla, crear una conversación en memoria para que el servicio continúe
+      // Esto permite que el servicio funcione incluso si MongoDB no está disponible
+      logger.warn(`[${FILE_NAME}] ⚠️ MongoDB no disponible, usando conversación en memoria`);
+      return {
+        _id: null,
+        userId,
+        domain,
+        messages: [],
+        status: 'active',
+        metadata: {
+          totalMessages: 0,
+          totalTokens: 0,
+          cachedTokens: 0,
+          modelsUsed: { gemini: 0, openai: 0, groq: 0 },
+          averageResponseTime: 0,
+        },
+        save: async function() {
+          logger.warn(`[${FILE_NAME}] ⚠️ Intento de guardar conversación en memoria (MongoDB no disponible)`);
+          // No hacer nada, solo loguear
+        },
+        isInMemory: true, // Flag para identificar conversaciones en memoria
+      };
+    }
   }
 
   /**
    * Obtiene historial reciente (últimos N mensajes)
    * OPTIMIZACIÓN: Reduce el historial para ahorrar tokens
-   * IMPORTANTE: Siempre preserva el system prompt como primer mensaje
+   * IMPORTANTE: NO incluye el system prompt, solo los últimos mensajes de conversación
    */
   getRecentHistory(conversation) {
     const FILE_NAME = 'chat-orchestrator.service.js';
@@ -461,46 +1165,55 @@ class ChatOrchestratorService {
     // Esto asegura que referencias como "ver más detalles" tengan el contexto necesario
     const maxHistory = Math.min(config.performance.maxConversationHistory || 10, 6);
     const messages = conversation.messages || [];
-
-    logger.info(`[${FILE_NAME}] getRecentHistory() - Total mensajes en conversación: ${messages.length}`);
-
+    
     if (messages.length === 0) {
       return [];
     }
 
-    // El primer mensaje siempre es el system prompt (memorizado)
-    const systemMessage = messages[0].role === 'system' ? [messages[0]] : [];
-
-    // Tomar los últimos N mensajes (excluyendo el system prompt)
-    const conversationMessages = messages.slice(systemMessage.length);
+    // Excluir el system prompt (si existe como primer mensaje)
+    const conversationMessages = messages[0]?.role === 'system' 
+      ? messages.slice(1) 
+      : messages;
+    
+    // Tomar los últimos N mensajes (sin system prompt)
     const recentMessages = conversationMessages.slice(-maxHistory);
-
-    logger.info(`[${FILE_NAME}] getRecentHistory() - Mensajes de conversación: ${conversationMessages.length}, Tomando últimos ${maxHistory}: ${recentMessages.length}`);
 
     // OPTIMIZACIÓN: Aumentar límite de caracteres para mantener contexto de productos
     const MAX_MESSAGE_LENGTH = 500; // Máximo 500 caracteres por mensaje (antes 300)
 
-    // Combinar: system prompt + mensajes recientes (truncados)
+    // Solo mensajes recientes (truncados), sin system prompt
     // MEJORA: Incluir metadata en el historial para facilitar búsqueda de productos
-    const history = [...systemMessage, ...recentMessages].map((msg, index) => {
+    const history = recentMessages.map((msg, index) => {
       let content = msg.content || '';
       const originalLength = content.length;
 
-      // MEJORA: Si el mensaje tiene metadata con información de producto, agregarla al contenido
-      // Esto ayuda a que el LLM y la búsqueda de productos tengan mejor contexto
-      if (msg.metadata && msg.metadata.lastProductShown) {
+      // MEJORA: Si el mensaje tiene información de productos mencionados, asegurar que esté en el contenido
+      // Esto ayuda a que el LLM tenga contexto de productos en mensajes anteriores
+      if (msg.metadata && msg.metadata.mentionedProducts && Array.isArray(msg.metadata.mentionedProducts)) {
+        // Si el contenido ya tiene [CONTEXTO_PRODUCTOS], no agregar de nuevo
+        if (!content.includes('[CONTEXTO_PRODUCTOS:')) {
+          const productsInfo = msg.metadata.mentionedProducts.map(p => 
+            `${p.title || 'Producto'} (ID: ${p.productId}${p.slug ? `, slug: ${p.slug}` : ''})`
+          ).join('; ');
+          content += `\n\n[CONTEXTO_PRODUCTOS: ${productsInfo}]`;
+        }
+      } else if (msg.metadata && msg.metadata.lastProductShown) {
+        // Fallback: si solo hay lastProductShown, agregarlo también
         const productInfo = msg.metadata.lastProductShown;
-        // Agregar información del producto al final del mensaje para referencia
-        content += ` [PRODUCTO_MENCIONADO: ID=${productInfo.productId}, slug=${productInfo.slug}, título=${productInfo.title}]`;
+        if (!content.includes('[CONTEXTO_PRODUCTOS:') && !content.includes('[PRODUCTO_MENCIONADO:')) {
+          content += `\n\n[CONTEXTO_PRODUCTOS: ${productInfo.title || 'Producto'} (ID: ${productInfo.productId}${productInfo.slug ? `, slug: ${productInfo.slug}` : ''})]`;
+        }
       } else if (msg.metadata && msg.metadata.action && msg.metadata.action.productId) {
+        // Fallback: si hay acción con producto, agregarlo también
         const action = msg.metadata.action;
-        content += ` [PRODUCTO_ACCION: ID=${action.productId}${action.slug ? `, slug=${action.slug}` : ''}${action.title ? `, título=${action.title}` : ''}]`;
+        if (!content.includes('[CONTEXTO_PRODUCTOS:') && !content.includes('[PRODUCTO_ACCION:')) {
+          content += `\n\n[CONTEXTO_PRODUCTOS: ${action.title || 'Producto'} (ID: ${action.productId}${action.slug ? `, slug: ${action.slug}` : ''})]`;
+        }
       }
 
-      // Truncar mensajes muy largos (excepto el system prompt)
-      if (msg.role !== 'system' && content.length > MAX_MESSAGE_LENGTH) {
+      // Truncar mensajes muy largos
+      if (content.length > MAX_MESSAGE_LENGTH) {
         content = content.substring(0, MAX_MESSAGE_LENGTH) + '...';
-        logger.info(`[${FILE_NAME}] Truncated message ${index} (${msg.role}) from ${originalLength} to ${content.length} chars`);
       }
 
       return {
@@ -508,13 +1221,6 @@ class ChatOrchestratorService {
         content: content,
         metadata: msg.metadata, // Incluir metadata para búsqueda
       };
-    });
-
-    // Log detallado del historial que se enviará
-    logger.info(`[${FILE_NAME}] getRecentHistory() - Historial preparado (${history.length} mensajes):`);
-    history.forEach((msg, idx) => {
-      const preview = msg.content.substring(0, 50).replace(/\n/g, ' ');
-      logger.info(`[${FILE_NAME}]   [${idx}] ${msg.role}: "${preview}${msg.content.length > 50 ? '...' : ''}" (${msg.content.length} chars)`);
     });
 
     return history;
@@ -559,7 +1265,6 @@ class ChatOrchestratorService {
     await Conversation.findByIdAndUpdate(conversationId, {
       status: 'closed',
     });
-    logger.info(`[Orchestrator] Closed conversation ${conversationId}`);
   }
 
   /**
@@ -586,6 +1291,18 @@ class ChatOrchestratorService {
   }
 
   /**
+   * @deprecated ELIMINADO: Este método usaba detección algorítmica de palabras clave.
+   * 
+   * ENFOQUE ACTUAL: Function calling puro
+   * - La IA decide qué tools usar mediante function calling nativo (OpenAI, Gemini, Groq)
+   * - No usamos algoritmos de detección de palabras clave
+   * - Confiamos completamente en la decisión de la IA basada en el prompt y las herramientas disponibles
+   * - Si la IA no usa tools cuando debería, debemos mejorar el prompt, no forzarlo con algoritmos
+   * 
+   * Este método fue eliminado porque era inconsistente con el enfoque de function calling puro.
+   */
+
+  /**
    * Actualiza el contexto persistente del producto en la conversación
    */
   updateProductContext(conversation, productData) {
@@ -608,8 +1325,6 @@ class ChatOrchestratorService {
         description: productData.description || productData.description_short || productData.description_long || null,
         updatedAt: new Date(),
       };
-
-      logger.info(`[${FILE_NAME}] ✅ Contexto de producto actualizado: ${conversation.metadata.lastProductContext.title} (${conversation.metadata.lastProductContext.productId})`);
     } catch (error) {
       logger.error(`[${FILE_NAME}] ❌ Error actualizando contexto de producto: ${error.message}`);
     }
@@ -638,8 +1353,6 @@ class ChatOrchestratorService {
         description: null,
         updatedAt: new Date(),
       };
-
-      logger.info(`[${FILE_NAME}] ✅ Contexto de producto actualizado desde acción: ${conversation.metadata.lastProductContext.title} (${conversation.metadata.lastProductContext.productId})`);
     } catch (error) {
       logger.error(`[${FILE_NAME}] ❌ Error actualizando contexto de producto desde acción: ${error.message}`);
     }
@@ -693,8 +1406,6 @@ class ChatOrchestratorService {
       // Ordenar por longitud (el más largo primero)
       searchTerms = searchTerms.sort((a, b) => b.length - a.length);
 
-      logger.info(`[${FILE_NAME}] findProductByNameInMessage() - Términos de búsqueda: ${searchTerms.slice(0, 3).join(', ')}`);
-
       const Product = getProductModel();
 
       // Buscar cada término
@@ -717,7 +1428,6 @@ class ChatOrchestratorService {
         .lean();
 
         if (product) {
-          logger.info(`[${FILE_NAME}] ✅ Producto encontrado por nombre: ${product.title} (${product._id})`);
           return {
             id: product._id.toString(),
             productId: product._id.toString(),
@@ -748,8 +1458,6 @@ class ChatOrchestratorService {
     if (!message || !domain) return null;
 
     try {
-      logger.info(`[${FILE_NAME}] extractProductFromMessage() - Mensaje: "${message.substring(0, 100)}"`);
-
       // Buscar patrones comunes de productos en el mensaje
       // Ejemplo: "Batidor GLOBO DE ACERO N° 22" o "Batidor GLOBO DE ACERO N° 22 añadido"
       // Mejorar el patrón para capturar títulos con números y caracteres especiales
@@ -776,13 +1484,9 @@ class ChatOrchestratorService {
           .filter(t => t.length > 5)
           .sort((a, b) => b.length - a.length);
 
-        logger.info(`[${FILE_NAME}] extractProductFromMessage() - Títulos potenciales encontrados: ${potentialTitles.length}`);
-
         // Buscar cada título potencial en la base de datos
         const Product = getProductModel();
         for (const potentialTitle of potentialTitles) {
-          logger.info(`[${FILE_NAME}] extractProductFromMessage() - Intentando buscar: "${potentialTitle}"`);
-
           // Crear regex más flexible para la búsqueda
           // Escapar caracteres especiales pero permitir variaciones
           const searchTitle = potentialTitle
@@ -797,7 +1501,6 @@ class ChatOrchestratorService {
           }).lean();
 
           if (product) {
-            logger.info(`[${FILE_NAME}] ✅ Producto encontrado por título: ${product.title} (${product._id})`);
             return {
               id: product._id.toString(),
               productId: product._id.toString(),
@@ -814,7 +1517,6 @@ class ChatOrchestratorService {
             const words = potentialTitle.split(/\s+/).slice(0, 3); // Primeras 3 palabras
             if (words.length >= 2) {
               const shortTitle = words.join(' ');
-              logger.info(`[${FILE_NAME}] extractProductFromMessage() - Intentando búsqueda flexible: "${shortTitle}"`);
 
               const productFlex = await Product.findOne({
                 domain,
@@ -823,7 +1525,6 @@ class ChatOrchestratorService {
               }).lean();
 
               if (productFlex) {
-                logger.info(`[${FILE_NAME}] ✅ Producto encontrado por búsqueda flexible: ${productFlex.title} (${productFlex._id})`);
                 return {
                   id: productFlex._id.toString(),
                   productId: productFlex._id.toString(),
@@ -860,7 +1561,6 @@ class ChatOrchestratorService {
     // PRIORIDAD 1: Buscar en el contexto persistente de la conversación (más confiable)
     if (conversation && conversation.metadata && conversation.metadata.lastProductContext && conversation.metadata.lastProductContext.productId) {
       const productContext = conversation.metadata.lastProductContext;
-      logger.info(`[${FILE_NAME}] findProductInHistory() - ✅ Product encontrado en contexto persistente: ${productContext.title} (${productContext.productId})`);
       return {
         productId: productContext.productId,
         foundIn: 'conversation_context',
@@ -872,13 +1572,10 @@ class ChatOrchestratorService {
     // Buscar en los últimos mensajes del historial
     const messagesToCheck = history.slice(-6).reverse(); // Últimos 6 mensajes, más recientes primero
 
-    logger.info(`[${FILE_NAME}] findProductInHistory() - Buscando productos en ${messagesToCheck.length} mensajes recientes`);
-
     for (const msg of messagesToCheck) {
       // 1. PRIORIDAD: Buscar en metadata.lastProductShown (mejor fuente - producto más reciente mostrado)
       if (msg.metadata && msg.metadata.lastProductShown) {
         const product = msg.metadata.lastProductShown;
-        logger.info(`[${FILE_NAME}] findProductInHistory() - ✅ Product encontrado en lastProductShown: ${product.productId} (${product.title})`);
         return {
           productId: product.productId,
           foundIn: msg.role,
@@ -890,7 +1587,6 @@ class ChatOrchestratorService {
       if (msg.metadata && msg.metadata.action) {
         const action = msg.metadata.action;
         if (action.productId) {
-          logger.info(`[${FILE_NAME}] findProductInHistory() - ✅ Product ID encontrado en metadata.action: ${action.productId}`);
           return {
             productId: action.productId,
             foundIn: msg.role,
@@ -898,7 +1594,6 @@ class ChatOrchestratorService {
           };
         }
         if (action.slug) {
-          logger.info(`[${FILE_NAME}] findProductInHistory() - ✅ Product slug encontrado en metadata.action: ${action.slug}`);
           return {
             productId: action.slug,
             foundIn: msg.role,
@@ -913,7 +1608,6 @@ class ChatOrchestratorService {
       // Buscar IDs de productos (MongoDB ObjectId) en el contenido
       const objectIdMatch = msg.content.match(/\b[0-9a-fA-F]{24}\b/);
       if (objectIdMatch) {
-        logger.info(`[${FILE_NAME}] findProductInHistory() - ✅ Product ID encontrado en contenido: ${objectIdMatch[0]}`);
         return {
           productId: objectIdMatch[0],
           foundIn: msg.role,
@@ -924,7 +1618,6 @@ class ChatOrchestratorService {
       // Buscar en el contenido agregado por getRecentHistory (PRODUCTO_MENCIONADO)
       const productoMencionadoMatch = msg.content.match(/\[PRODUCTO_MENCIONADO:.*?ID=([a-zA-Z0-9\-_]+)/);
       if (productoMencionadoMatch) {
-        logger.info(`[${FILE_NAME}] findProductInHistory() - ✅ Product ID encontrado en PRODUCTO_MENCIONADO: ${productoMencionadoMatch[1]}`);
         return {
           productId: productoMencionadoMatch[1],
           foundIn: msg.role,
@@ -948,20 +1641,16 @@ class ChatOrchestratorService {
           const foundSlug = slugMatch[1].toLowerCase();
           // Validar que no sea una palabra común
           if (!commonWords.includes(foundSlug) && foundSlug.length >= 3) {
-            logger.info(`[${FILE_NAME}] findProductInHistory() - ✅ Product identificador encontrado: ${slugMatch[1]}`);
             return {
               productId: slugMatch[1],
               foundIn: msg.role,
               context: msg.content.substring(0, 100),
             };
-          } else {
-            logger.debug(`[${FILE_NAME}] findProductInHistory() - ⚠️ Ignorando palabra común: ${foundSlug}`);
           }
         }
       }
     }
 
-    logger.info(`[${FILE_NAME}] findProductInHistory() - ❌ No se encontró producto en el historial`);
     return null;
   }
 

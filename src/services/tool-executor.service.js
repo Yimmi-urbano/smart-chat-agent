@@ -13,6 +13,7 @@
  */
 
 const getProductModel = require('../models/Product');
+const getConfigurationModel = require('../models/Configuration');
 const logger = require('../utils/logger');
 const axios = require('axios');
 const config = require('../config/env.config');
@@ -27,43 +28,31 @@ class ToolExecutorService {
    */
   async executeTool(intent, params, domain) {
     const FILE_NAME = 'tool-executor.service.js';
-    
-    logger.info(`[${FILE_NAME}] ────────────────────────────────────────`);
-    logger.info(`[${FILE_NAME}] 🔧 EJECUTANDO TOOL`);
-    logger.info(`[${FILE_NAME}] Intent: ${intent}`);
-    logger.info(`[${FILE_NAME}] Params: ${JSON.stringify(params)}`);
-    logger.info(`[${FILE_NAME}] Domain: ${domain}`);
 
     let result = null;
 
     switch (intent) {
       case 'search_products':
-        logger.info(`[${FILE_NAME}] Ejecutando: searchProducts()`);
         result = await this.searchProducts(params, domain);
         break;
       
       case 'add_to_cart':
-        logger.info(`[${FILE_NAME}] Ejecutando: addToCart()`);
         result = await this.addToCart(params, domain);
         break;
       
       case 'company_info':
-        logger.info(`[${FILE_NAME}] Ejecutando: getCompanyInfo()`);
         result = await this.getCompanyInfo(domain);
         break;
       
       case 'product_price':
-        logger.info(`[${FILE_NAME}] Ejecutando: getProductPrice()`);
         result = await this.getProductPrice(params, domain);
         break;
       
       case 'product_details':
-        logger.info(`[${FILE_NAME}] Ejecutando: getProductDetails()`);
         result = await this.getProductDetails(params, domain);
         break;
       
       case 'shipping_info':
-        logger.info(`[${FILE_NAME}] Ejecutando: getShippingInfo()`);
         result = await this.getShippingInfo(domain);
         break;
       
@@ -72,21 +61,9 @@ class ToolExecutorService {
         return null;
     }
 
-    if (result) {
-      logger.info(`[${FILE_NAME}] ✅ Tool ejecutado exitosamente: ${result.tool}`);
-      if (result.data) {
-        const dataSummary = result.data.count !== undefined 
-          ? `count: ${result.data.count}`
-          : result.data.products 
-          ? `products: ${result.data.products.length}`
-          : 'data available';
-        logger.info(`[${FILE_NAME}] Resultado: ${dataSummary}`);
-      }
-    } else {
+    if (!result) {
       logger.warn(`[${FILE_NAME}] ⚠️ Tool no retornó resultado`);
     }
-    
-    logger.info(`[${FILE_NAME}] ────────────────────────────────────────`);
     
     return result;
   }
@@ -111,8 +88,6 @@ class ToolExecutorService {
         .split(/\s+/)
         .filter(w => w.length > 2) // Filtrar palabras muy cortas
         .map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')); // Escapar caracteres especiales
-      
-      logger.info(`[ToolExecutor] Búsqueda flexible para: "${query}" → palabras clave: [${keywords.join(', ')}]`);
       
       if (keywords.length > 0) {
         // Estrategia 1: Búsqueda por palabras individuales (más flexible)
@@ -203,8 +178,6 @@ class ToolExecutorService {
       products = products.slice(0, Math.min(limit, 10));
     }
 
-    logger.info(`[ToolExecutor] Found ${products.length} products for query: "${query}"`);
-
     return {
       tool: 'search_products',
       data: {
@@ -247,14 +220,10 @@ class ToolExecutorService {
     const FILE_NAME = 'tool-executor.service.js';
     const { productId, query, quantity = 1 } = params;
     
-    logger.info(`[${FILE_NAME}] addToCart() - productId: ${productId || 'N/A'}, query: ${query || 'N/A'}, quantity: ${quantity}`);
-    
     // Si hay productId, obtener información del producto
     if (productId) {
-      logger.info(`[${FILE_NAME}] Buscando producto por ID: ${productId}`);
       const productDetails = await this.getProductDetails({ productId }, domain);
       if (productDetails && productDetails.data) {
-        logger.info(`[${FILE_NAME}] ✅ Producto encontrado por ID: ${productDetails.data.title}`);
         return {
           tool: 'add_to_cart',
           data: {
@@ -273,11 +242,9 @@ class ToolExecutorService {
     
     // Si hay query, buscar el producto primero
     if (query) {
-      logger.info(`[${FILE_NAME}] Buscando producto por query: "${query}"`);
       const searchResult = await this.searchProducts({ query, limit: 1 }, domain);
       if (searchResult && searchResult.data && searchResult.data.products && searchResult.data.products.length > 0) {
         const product = searchResult.data.products[0];
-        logger.info(`[${FILE_NAME}] ✅ Producto encontrado por query: ${product.title}`);
         return {
           tool: 'add_to_cart',
           data: {
@@ -299,44 +266,94 @@ class ToolExecutorService {
   }
 
   /**
-   * Obtiene información de la empresa
+   * Obtiene información de la empresa desde MongoDB
+   * Extrae: title, meta_description, social_links, whatsapp_home, type_store, meta_keyword, slogan
    */
   async getCompanyInfo(domain) {
+    const FILE_NAME = 'tool-executor.service.js';
     try {
-      if (!config.api.configurationUrl) {
-        return {
-          tool: 'company_info',
-          data: {
-            name: domain,
-            description: 'Información de la empresa no disponible',
-          },
-        };
+      // Intentar obtener desde MongoDB (configuración)
+      const Configuration = getConfigurationModel();
+      
+      if (Configuration) {
+        const configData = await Configuration.findOne({ domain }).lean();
+        
+        if (configData) {
+          // Extraer solo los campos requeridos
+          const companyInfo = {
+            title: configData.title || '',
+            slogan: configData.slogan || '',
+            meta_description: configData.meta_description || '',
+            meta_keyword: configData.meta_keyword || '',
+            type_store: configData.type_store || '',
+            social_links: configData.social_links || [],
+            whatsapp_home: configData.whatsapp_home || null,
+          };
+          
+          return {
+            tool: 'company_info',
+            data: companyInfo,
+          };
+        } else {
+          logger.warn(`[${FILE_NAME}] ⚠️ No se encontró configuración en MongoDB para dominio: ${domain}`);
+        }
+      } else {
+        logger.warn(`[${FILE_NAME}] ⚠️ Conexión a base de datos de configuración no disponible`);
       }
+      
+      // Fallback: Intentar obtener desde API si está configurada
+      if (config.api.configurationUrl) {
+        try {
+          const { data } = await axios.get(`${config.api.configurationUrl}/api/configurations`, {
+            headers: { domain },
+            timeout: 5000,
+          });
 
-      const { data } = await axios.get(`${config.api.configurationUrl}/api/configurations`, {
-        headers: { domain },
-        timeout: 5000,
-      });
+          const businessConfig = data?.[0] || { name: domain };
 
-      const businessConfig = data?.[0] || { name: domain };
-
+          return {
+            tool: 'company_info',
+            data: {
+              title: businessConfig.title || businessConfig.name || domain,
+              slogan: businessConfig.slogan || '',
+              meta_description: businessConfig.meta_description || businessConfig.description || '',
+              meta_keyword: businessConfig.meta_keyword || '',
+              type_store: businessConfig.type_store || '',
+              social_links: businessConfig.social_links || [],
+              whatsapp_home: businessConfig.whatsapp_home || null,
+            },
+          };
+        } catch (apiError) {
+          logger.error(`[${FILE_NAME}] Error obteniendo configuración desde API: ${apiError.message}`);
+        }
+      }
+      
+      // Si no se pudo obtener de ninguna fuente, retornar datos mínimos
       return {
         tool: 'company_info',
         data: {
-          name: businessConfig.name || domain,
-          description: businessConfig.description || businessConfig.about || '',
-          address: businessConfig.address || '',
-          phone: businessConfig.phone || '',
-          email: businessConfig.email || '',
+          title: domain,
+          slogan: '',
+          meta_description: 'Información de la empresa no disponible',
+          meta_keyword: '',
+          type_store: '',
+          social_links: [],
+          whatsapp_home: null,
         },
       };
     } catch (error) {
-      logger.error(`[ToolExecutor] Error getting company info: ${error.message}`);
+      logger.error(`[${FILE_NAME}] ❌ Error getting company info: ${error.message}`);
+      logger.error(`[${FILE_NAME}] Stack: ${error.stack}`);
       return {
         tool: 'company_info',
         data: {
-          name: domain,
-          description: 'No se pudo obtener la información de la empresa',
+          title: domain,
+          slogan: '',
+          meta_description: 'No se pudo obtener la información de la empresa',
+          meta_keyword: '',
+          type_store: '',
+          social_links: [],
+          whatsapp_home: null,
         },
       };
     }
@@ -417,8 +434,6 @@ class ToolExecutorService {
       return null;
     }
 
-    logger.info(`[${FILE_NAME}] getProductDetails() - Buscando producto: ${productId} (${isObjectId ? 'ObjectId' : 'slug'})`);
-
     const Product = getProductModel();
     
     try {
@@ -434,14 +449,16 @@ class ToolExecutorService {
         query.slug = productId;
       }
       
-      const product = await Product.findOne(query).lean();
+      // OPTIMIZACIÓN MULTITENANT: Usar select() para limitar campos y mejorar performance
+      // Solo seleccionar campos necesarios para la respuesta
+      const product = await Product.findOne(query)
+        .select('title slug price image_default category tags description_short description_long _id')
+        .lean();
 
       if (!product) {
         logger.warn(`[${FILE_NAME}] getProductDetails() - ❌ Producto no encontrado: ${productId}`);
         return null;
       }
-      
-      logger.info(`[${FILE_NAME}] getProductDetails() - ✅ Producto encontrado: ${product.title || productId}`);
 
       return {
         tool: 'product_details',

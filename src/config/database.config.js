@@ -15,6 +15,9 @@ let mainConnection = null;
 // Conexión de clientes (conversaciones)
 let clientsConnection = null;
 
+// Conexión de configuración
+let configConnection = null;
+
 /**
  * Conecta a la base de datos principal
  */
@@ -24,8 +27,20 @@ async function connectMainDatabase() {
       return mainConnection;
     }
 
-    mainConnection = await mongoose.createConnection(config.mongo.uri, config.mongo.options);
-    logger.info('✅ Main database connected');
+    // OPTIMIZACIÓN MULTITENANT: Pool de conexiones optimizado para múltiples dominios
+    const optimizedOptions = {
+      ...config.mongo.options,
+      // Aumentar pool size para multitenant (más dominios = más conexiones concurrentes)
+      maxPoolSize: config.mongo.options?.maxPoolSize || 50,
+      minPoolSize: config.mongo.options?.minPoolSize || 5,
+      // Mantener conexiones vivas más tiempo para reutilización
+      maxIdleTimeMS: config.mongo.options?.maxIdleTimeMS || 30000,
+      // Timeouts optimizados para multitenant
+      serverSelectionTimeoutMS: config.mongo.options?.serverSelectionTimeoutMS || 5000,
+      socketTimeoutMS: config.mongo.options?.socketTimeoutMS || 45000,
+    };
+    
+    mainConnection = await mongoose.createConnection(config.mongo.uri, optimizedOptions);
     return mainConnection;
   } catch (error) {
     logger.error('❌ Main database connection error:', error);
@@ -42,11 +57,52 @@ async function connectClientsDatabase() {
       return clientsConnection;
     }
 
-    clientsConnection = await mongoose.createConnection(config.mongo.clientsUri, config.mongo.options);
-    logger.info('✅ Clients database connected');
+    // OPTIMIZACIÓN MULTITENANT: Pool de conexiones optimizado
+    const optimizedOptions = {
+      ...config.mongo.options,
+      maxPoolSize: config.mongo.options?.maxPoolSize || 50,
+      minPoolSize: config.mongo.options?.minPoolSize || 5,
+      maxIdleTimeMS: config.mongo.options?.maxIdleTimeMS || 30000,
+      serverSelectionTimeoutMS: config.mongo.options?.serverSelectionTimeoutMS || 5000,
+      socketTimeoutMS: config.mongo.options?.socketTimeoutMS || 45000,
+    };
+    
+    clientsConnection = await mongoose.createConnection(config.mongo.clientsUri, optimizedOptions);
     return clientsConnection;
   } catch (error) {
     logger.error('❌ Clients database connection error:', error);
+    throw error;
+  }
+}
+
+/**
+ * Conecta a la base de datos de configuración
+ */
+async function connectConfigDatabase() {
+  try {
+    if (!config.mongo.configUri) {
+      logger.warn('⚠️ MONGO_URI_CONFIG not configured, skipping config database connection');
+      return null;
+    }
+
+    if (configConnection && configConnection.readyState === 1) {
+      return configConnection;
+    }
+
+    // OPTIMIZACIÓN MULTITENANT: Pool de conexiones optimizado
+    const optimizedOptions = {
+      ...config.mongo.options,
+      maxPoolSize: config.mongo.options?.maxPoolSize || 20, // Menos conexiones para config (menos consultas)
+      minPoolSize: config.mongo.options?.minPoolSize || 2,
+      maxIdleTimeMS: config.mongo.options?.maxIdleTimeMS || 60000, // Más tiempo idle (config cambia poco)
+      serverSelectionTimeoutMS: config.mongo.options?.serverSelectionTimeoutMS || 5000,
+      socketTimeoutMS: config.mongo.options?.socketTimeoutMS || 45000,
+    };
+    
+    configConnection = await mongoose.createConnection(config.mongo.configUri, optimizedOptions);
+    return configConnection;
+  } catch (error) {
+    logger.error('❌ Config database connection error:', error);
     throw error;
   }
 }
@@ -57,6 +113,7 @@ async function connectClientsDatabase() {
 async function initializeDatabases() {
   await connectMainDatabase();
   await connectClientsDatabase();
+  await connectConfigDatabase();
 }
 
 /**
@@ -65,11 +122,12 @@ async function initializeDatabases() {
 async function closeDatabases() {
   if (mainConnection) {
     await mainConnection.close();
-    logger.info('Main database disconnected');
   }
   if (clientsConnection) {
     await clientsConnection.close();
-    logger.info('Clients database disconnected');
+  }
+  if (configConnection) {
+    await configConnection.close();
   }
 }
 
@@ -93,6 +151,18 @@ function getClientsConnection() {
   return clientsConnection;
 }
 
+/**
+ * Obtiene la conexión de configuración (lazy getter)
+ */
+function getConfigConnection() {
+  if (!configConnection) {
+    // No lanzar error, solo warning, porque puede no estar configurado
+    logger.warn('Config database connection not initialized. Call connectConfigDatabase() first.');
+    return null;
+  }
+  return configConnection;
+}
+
 module.exports = {
   get mainConnection() {
     return getMainConnection();
@@ -100,12 +170,16 @@ module.exports = {
   get clientsConnection() {
     return getClientsConnection();
   },
+  get configConnection() {
+    return getConfigConnection();
+  },
   connectMainDatabase,
   connectClientsDatabase,
+  connectConfigDatabase,
   initializeDatabases,
   closeDatabases,
-  // Exportar funciones para uso directo
   getMainConnection,
   getClientsConnection,
+  getConfigConnection,
 };
 
