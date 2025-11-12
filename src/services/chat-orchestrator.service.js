@@ -571,7 +571,7 @@ class ChatOrchestratorService {
         promptLength: promptFull.length,
         systemPromptHash: promptHashForAudit,
         intent_interpreted: interpretedIntent,
-        tool_executed: toolResult,
+        tool_executed: toolResults || [], // Usar toolResults (plural) que es el array completo
     };
 
     // MEJORA: Extraer información de productos de functionResults para incluir en el historial
@@ -1028,11 +1028,9 @@ class ChatOrchestratorService {
 
       if (messages.length > 0) {
         const lastMessage = messages[messages.length - 1];
-        // Verificar si el último mensaje del asistente usó la herramienta is_farewell
-        if (lastMessage.role === 'assistant' && lastMessage.metadata && lastMessage.metadata.tool_executed) {
-          // El formato de tool_executed puede variar, así que lo manejamos flexiblemente
-          const tools = Array.isArray(lastMessage.metadata.tool_executed) ? lastMessage.metadata.tool_executed : [lastMessage.metadata.tool_executed];
-          lastMessageWasFarewell = tools.some(tool => tool && (tool.tool === 'is_farewell' || tool.functionName === 'is_farewell'));
+        // Programación defensiva: asegurar que metadata y tool_executed existen y son un array
+        if (lastMessage.role === 'assistant' && lastMessage.metadata && Array.isArray(lastMessage.metadata.tool_executed)) {
+          lastMessageWasFarewell = lastMessage.metadata.tool_executed.some(tool => tool && tool.functionName === 'is_farewell');
         }
       }
 
