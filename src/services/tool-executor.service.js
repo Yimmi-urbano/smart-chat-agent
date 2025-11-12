@@ -73,7 +73,10 @@ class ToolExecutorService {
    * El LLM ya interpretó la intención, aquí hacemos búsqueda flexible por palabras clave
    */
   async searchProducts(params, domain) {
+    const FILE_NAME = 'tool-executor.service.js';
     const { query = '', category, minPrice, maxPrice, limit = 5 } = params;
+
+    logger.info(`[${FILE_NAME}] 🔍 Búsqueda de productos iniciada`, { domain, query, category, minPrice, maxPrice, limit });
 
     const filter = {
       domain,
@@ -81,34 +84,8 @@ class ToolExecutorService {
     };
 
     if (query) {
-      // Búsqueda flexible: buscar palabras individuales que pueden estar en cualquier orden
-      // Esto permite encontrar "batería portátil" cuando buscan "cargadores portátiles"
-      const keywords = query
-        .toLowerCase()
-        .split(/\s+/)
-        .filter(w => w.length > 2) // Filtrar palabras muy cortas
-        .map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')); // Escapar caracteres especiales
-      
-      if (keywords.length > 0) {
-        // Estrategia 1: Búsqueda por palabras individuales (más flexible)
-        // Buscar productos que contengan CUALQUIERA de las palabras clave
-        // Esto permite encontrar productos relacionados aunque no coincidan exactamente
-        const wordRegex = new RegExp(`(${keywords.join('|')})`, 'i');
-        
-        filter.$or = [
-          // Buscar en título (mayor peso)
-          { title: wordRegex },
-          // Buscar en descripción corta
-          { description_short: wordRegex },
-          // Buscar en descripción larga
-          { description_long: wordRegex },
-          // Buscar en categoría
-          { 'category.slug': wordRegex },
-          { 'category.name': wordRegex },
-          // Buscar en tags
-          { tags: wordRegex },
-        ];
-      }
+      // Búsqueda de texto completo de MongoDB (más potente para lenguaje natural)
+      filter.$text = { $search: query };
     }
 
     if (category) {
@@ -122,61 +99,19 @@ class ToolExecutorService {
     }
 
     const Product = getProductModel();
-    let products = await Product
-      .find(filter)
-      .limit(Math.min(limit * 2, 20))
+    let productsQuery = Product.find(filter);
+
+    // Si es una búsqueda de texto, ordenar por relevancia
+    if (query) {
+      productsQuery = productsQuery.sort({ score: { $meta: 'textScore' } });
+    }
+
+    const products = await productsQuery
+      .limit(Math.min(limit, 10))
       .select('title description_short price slug category image_default is_available tags')
       .lean();
 
-    // Ordenar por relevancia basado en coincidencias de palabras clave
-    if (query && products.length > 1) {
-      const keywords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-      
-      products = products
-        .map(p => {
-          const titleLower = (p.title || '').toLowerCase();
-          const descLower = ((p.description_short || '') + ' ' + (p.description_long || '')).toLowerCase();
-          
-          let score = 0;
-          
-          // Calcular relevancia basado en cuántas palabras clave coinciden
-          keywords.forEach(kw => {
-            // Mayor puntuación si la palabra está en el título
-            if (titleLower.includes(kw)) {
-              score += 10;
-              // Bonus si está al inicio del título
-              if (titleLower.startsWith(kw) || titleLower.indexOf(` ${kw}`) === 0) {
-                score += 5;
-              }
-            }
-            // Puntuación media si está en la descripción
-            if (descLower.includes(kw)) {
-              score += 3;
-            }
-          });
-          
-          // Bonus si todas las palabras clave aparecen (coincidencia completa)
-          const allKeywordsMatch = keywords.every(kw => 
-            titleLower.includes(kw) || descLower.includes(kw)
-          );
-          if (allKeywordsMatch) {
-            score += 10;
-          }
-          
-          return { ...p, _relevanceScore: score };
-        })
-        .sort((a, b) => {
-          // Ordenar por relevancia (mayor a menor)
-          if (b._relevanceScore !== a._relevanceScore) {
-            return b._relevanceScore - a._relevanceScore;
-          }
-          // Si hay empate, ordenar alfabéticamente
-          return (a.title || '').localeCompare(b.title || '');
-        })
-        .slice(0, Math.min(limit, 10));
-    } else {
-      products = products.slice(0, Math.min(limit, 10));
-    }
+    logger.info(`[${FILE_NAME}] ✅ Búsqueda de productos finalizada. Encontrados: ${products.length} productos.`);
 
     return {
       tool: 'search_products',

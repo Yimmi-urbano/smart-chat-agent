@@ -46,10 +46,29 @@ const productSchema = new mongoose.Schema({
 });
 
 // OPTIMIZACIÓN MULTITENANT: Índices compuestos para búsquedas rápidas por dominio
-// Los índices deben empezar con domain (clave de partición multitenant)
 productSchema.index({ domain: 1, is_available: 1 });
 productSchema.index({ domain: 1, 'category.slug': 1 });
-productSchema.index({ domain: 1, title: 'text', description_short: 'text' });
+
+// Índice de texto para búsqueda semántica (más flexible)
+// Incluye campos clave para encontrar productos por lenguaje natural
+productSchema.index({
+  domain: 1,
+  title: 'text',
+  description_short: 'text',
+  description_long: 'text',
+  'category.name': 'text',
+  tags: 'text',
+}, {
+  weights: {
+    title: 10,
+    'category.name': 5,
+    tags: 5,
+    description_short: 2,
+    description_long: 1,
+  },
+  name: 'product_text_search_index',
+});
+
 // Índice para búsquedas por slug (muy común)
 productSchema.index({ domain: 1, slug: 1 });
 // Índice para búsquedas por ID (muy común)
