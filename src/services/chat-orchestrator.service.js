@@ -669,19 +669,19 @@ class ChatOrchestratorService {
         metadata: assistantMetadata,
     });
 
-    // MEJORA: El contexto del producto se inyecta como un mensaje de sistema separado
-    // Esto es más limpio y claro para el LLM que adjuntarlo al mensaje del usuario
+    // MEJORA: El contexto del producto se inyecta como un mensaje de sistema separado.
+    // Se usa un formato simple y claro (tipo atributo) para que la IA lo pueda parsear fácilmente.
     if (uniqueProducts.length > 0) {
-        const productsInfo = uniqueProducts.map(p =>
-            `${p.title || 'Producto'} (ID: ${p.productId}${p.slug ? `, slug: ${p.slug}` : ''})`
-        ).join('; ');
+      const contextAttributes = uniqueProducts.map(p =>
+        `productId="${p.productId || ''}" slug="${p.slug || ''}" title="${p.title || ''}"`
+      ).join(' ');
 
-        conversation.messages.push({
-            role: 'system',
-            content: `[CONTEXTO_PRODUCTOS: ${productsInfo}]`,
-            timestamp: new Date(),
-            metadata: { type: 'product_context' }
-        });
+      conversation.messages.push({
+        role: 'system',
+        content: `[CONTEXTO ${contextAttributes}]`,
+        timestamp: new Date(),
+        metadata: { type: 'product_context' },
+      });
     }
 
     // Asegurar que metadata existe (para conversaciones en memoria)

@@ -347,6 +347,8 @@ class ToolExecutorService {
   async getProductDetails(params, domain) {
     const FILE_NAME = 'tool-executor.service.js';
     const { productId } = params;
+
+    logger.info(`[${FILE_NAME}] ℹ️ Obteniendo detalles para productId: "${productId}"`, { domain });
     
     if (!productId) {
       logger.warn(`[${FILE_NAME}] getProductDetails() - ❌ productId no proporcionado`);
