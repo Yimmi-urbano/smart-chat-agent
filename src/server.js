@@ -17,6 +17,7 @@ const errorHandler = require('./api/middlewares/error-handler.middleware');
 
 // Importar rutas
 const chatRoutes = require('./api/routes/chat.routes');
+const textToSpeechRoutes = require('./api/routes/text-to-speech.routes');
 
 const app = express();
 
@@ -49,6 +50,7 @@ app.get('/health', (req, res) => {
 
 // API Routes
 app.use('/api/chat', chatRoutes);
+app.use('/api/text-to-speech', textToSpeechRoutes);
 
 // Error handler
 app.use(errorHandler);
@@ -66,15 +68,11 @@ async function startServer() {
   try {
     // Inicializar bases de datos
     await initializeDatabases();
-    logger.info('✅ Databases initialized');
 
     // Iniciar servidor
     const port = config.port;
     app.listen(port, () => {
-      logger.info(`🚀 Server running on port ${port}`);
-      logger.info(`📝 Environment: ${config.node_env}`);
-      logger.info(`💾 Prompt caching: ${config.features.promptCaching ? 'enabled' : 'disabled'}`);
-      logger.info(`🤖 Model router: ${config.router.defaultProvider}`);
+      // Server started successfully
     });
   } catch (error) {
     logger.error('❌ Failed to start server:', error);

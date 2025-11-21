@@ -7,7 +7,8 @@
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "test": "jest --coverage",
-    "lint": "eslint src/"
+    "lint": "eslint src/",
+    "check-env": "node scripts/check-env.js"
   },
   "keywords": [
     "ai",
@@ -22,6 +23,7 @@
   "license": "MIT",
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
+    "aws-sdk": "^2.1692.0",
     "axios": "^1.7.9",
     "body-parser": "^1.20.3",
     "compression": "^1.7.4",

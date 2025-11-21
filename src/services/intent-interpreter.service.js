@@ -34,8 +34,6 @@ class IntentInterpreterService {
     if (this.useLLM) {
       this.initLLMs();
     }
-    
-    logger.info(`[IntentInterpreter] Enabled: ${this.enabled}, Local: ${this.useLocal}, LLM: ${this.useLLM}`);
   }
 
   /**
@@ -65,14 +63,8 @@ class IntentInterpreterService {
   async interpret(userMessage, language = 'es', domain = '') {
     const FILE_NAME = 'intent-interpreter.service.js';
     
-    logger.info(`[${FILE_NAME}] ────────────────────────────────────────`);
-    logger.info(`[${FILE_NAME}] 🔍 INICIANDO INTERPRETACIÓN DE INTENCIÓN`);
-    logger.info(`[${FILE_NAME}] Mensaje: "${userMessage.substring(0, 50)}${userMessage.length > 50 ? '...' : ''}"`);
-    logger.info(`[${FILE_NAME}] Idioma: ${language} | Dominio: ${domain}`);
-    
     // Si está deshabilitado, retornar intención por defecto
     if (!this.enabled) {
-      logger.info(`[${FILE_NAME}] ⚠️ Intérprete deshabilitado, retornando general_chat`);
       return {
         intent: 'general_chat',
         params: {},
@@ -85,47 +77,34 @@ class IntentInterpreterService {
     const cacheKey = this.getCacheKey(userMessage, language);
     const cached = this.getFromCache(cacheKey);
     if (cached) {
-      logger.info(`[${FILE_NAME}] ✅ Cache hit: ${cached.intent} (${cached.confidence})`);
       return cached;
     }
-    logger.info(`[${FILE_NAME}] Cache miss, procesando...`);
 
     let result = null;
     let method = 'none';
 
     // 1. Intentar reglas locales primero (si está habilitado)
     if (this.useLocal) {
-      logger.info(`[${FILE_NAME}] [1/3] Intentando interpretación con reglas locales...`);
       result = this.interpretWithLocalRules(userMessage, language);
       if (result && result.confidence >= 0.7) {
         method = 'local_rules';
-        logger.info(`[${FILE_NAME}] [1/3] ✅ Reglas locales matched: ${result.intent} (confidence: ${result.confidence})`);
-      } else {
-        logger.info(`[${FILE_NAME}] [1/3] ❌ Reglas locales no match o confidence bajo (${result?.confidence || 0})`);
       }
-    } else {
-      logger.info(`[${FILE_NAME}] [1/3] ⚠️ Reglas locales deshabilitadas`);
     }
 
     // 2. Si las reglas locales fallan o no están habilitadas, usar LLM
     if (!result || result.confidence < 0.7) {
       if (this.useLLM) {
-        logger.info(`[${FILE_NAME}] [2/3] Usando LLM para interpretación...`);
         result = await this.interpretWithLLM(userMessage, language, domain);
         if (result) {
           method = result.method || 'llm';
-          logger.info(`[${FILE_NAME}] [2/3] ✅ LLM interpretó: ${result.intent} (confidence: ${result.confidence}, method: ${method})`);
         } else {
           logger.warn(`[${FILE_NAME}] [2/3] ⚠️ LLM no retornó resultado`);
         }
-      } else {
-        logger.info(`[${FILE_NAME}] [2/3] ⚠️ LLM deshabilitado`);
       }
     }
 
     // 3. Si todo falla, usar intención por defecto
     if (!result) {
-      logger.info(`[${FILE_NAME}] [3/3] Usando intención por defecto (general_chat)`);
       result = {
         intent: 'general_chat',
         params: {},
@@ -136,8 +115,6 @@ class IntentInterpreterService {
 
     // Guardar en cache
     this.saveToCache(cacheKey, result);
-    logger.info(`[${FILE_NAME}] ✅ Interpretación completada: ${result.intent} (${result.confidence})`);
-    logger.info(`[${FILE_NAME}] ────────────────────────────────────────`);
 
     return {
       ...result,
@@ -155,11 +132,8 @@ class IntentInterpreterService {
     const FILE_NAME = 'intent-interpreter.service.js';
     const normalizedMessage = message.toLowerCase().trim();
     
-    logger.info(`[${FILE_NAME}] interpretWithLocalRules() - Analizando: "${normalizedMessage.substring(0, 30)}..."`);
-    
     // Patrones por idioma
     const patterns = this.getPatternsByLanguage(language);
-    logger.info(`[${FILE_NAME}] Patrones disponibles: ${Object.keys(patterns).join(', ')}`);
     
     let bestMatch = null;
     let bestScore = 0;
@@ -172,7 +146,6 @@ class IntentInterpreterService {
       // Verificar regex
       if (regex && regex.test(normalizedMessage)) {
         score += 0.5;
-        logger.info(`[${FILE_NAME}] Regex match para ${intent}: ✅`);
       }
       
       // Verificar keywords
@@ -181,9 +154,6 @@ class IntentInterpreterService {
           normalizedMessage.includes(keyword.toLowerCase())
         ).length;
         score += (foundKeywords / keywords.length) * 0.5;
-        if (foundKeywords > 0) {
-          logger.info(`[${FILE_NAME}] Keywords match para ${intent}: ${foundKeywords}/${keywords.length}`);
-        }
       }
       
       if (score > bestScore) {
@@ -193,14 +163,7 @@ class IntentInterpreterService {
           params: this.extractParamsFromMessage(message, intent, language),
           confidence: Math.min(score * confidence, 0.95),
         };
-        logger.info(`[${FILE_NAME}] Nuevo mejor match: ${intent} (score: ${score}, confidence: ${bestMatch.confidence})`);
       }
-    }
-
-    if (bestMatch) {
-      logger.info(`[${FILE_NAME}] ✅ Mejor match encontrado: ${bestMatch.intent} (confidence: ${bestMatch.confidence})`);
-    } else {
-      logger.info(`[${FILE_NAME}] ❌ No se encontró match con reglas locales`);
     }
 
     return bestMatch;
@@ -471,8 +434,6 @@ class IntentInterpreterService {
   async interpretWithOpenAI(message, language, domain) {
     const FILE_NAME = 'intent-interpreter.service.js';
     
-    logger.info(`[${FILE_NAME}] interpretWithOpenAI() - Llamando a OpenAI...`);
-    
     const systemPrompt = `Eres un clasificador de intenciones para ${domain || 'una tienda online'}.
     
 Clasifica la intención del usuario en JSON válido:
@@ -502,10 +463,8 @@ Responde SOLO con JSON válido.`;
       });
 
       const content = response.choices[0].message.content;
-      logger.info(`[${FILE_NAME}] Respuesta de OpenAI: ${content.substring(0, 100)}...`);
       
       const parsed = JSON.parse(content);
-      logger.info(`[${FILE_NAME}] ✅ OpenAI interpretó: ${parsed.intent} (confidence: ${parsed.confidence})`);
 
       return {
         intent: parsed.intent || 'general_chat',
@@ -523,8 +482,6 @@ Responde SOLO con JSON válido.`;
    */
   async interpretWithGemini(message, language, domain) {
     const FILE_NAME = 'intent-interpreter.service.js';
-    
-    logger.info(`[${FILE_NAME}] interpretWithGemini() - Llamando a Gemini...`);
     
     const prompt = `Eres un clasificador de intenciones para ${domain || 'una tienda online'}.
 
@@ -554,13 +511,11 @@ Mensaje del usuario: ${message}`;
 
       const result = await model.generateContent(prompt);
       const response = result.response.text();
-      logger.info(`[${FILE_NAME}] Respuesta de Gemini: ${response.substring(0, 100)}...`);
       
       // Extraer JSON de la respuesta
       const jsonMatch = response.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         const parsed = JSON.parse(jsonMatch[0]);
-        logger.info(`[${FILE_NAME}] ✅ Gemini interpretó: ${parsed.intent} (confidence: ${parsed.confidence})`);
         return {
           intent: parsed.intent || 'general_chat',
           params: parsed.params || {},
@@ -611,7 +566,6 @@ Mensaje del usuario: ${message}`;
    */
   clearCache() {
     this.cache.clear();
-    logger.info('[IntentInterpreter] Cache cleared');
   }
 }
 

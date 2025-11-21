@@ -12,6 +12,10 @@ const logger = require('../../utils/logger');
 class ChatController {
   constructor() {
     this.orchestrator = new ChatOrchestratorService();
+    this.sendMessage = this.sendMessage.bind(this);
+    this.getHistory = this.getHistory.bind(this);
+    this.closeConversation = this.closeConversation.bind(this);
+    this.getStats = this.getStats.bind(this);
   }
 
   /**
@@ -20,7 +24,7 @@ class ChatController {
    */
   async sendMessage(req, res) {
     try {
-      const { userMessage, domain, userId, forceModel } = req.body;
+      const { userMessage, domain, userId, forceModel, stream } = req.body;
 
       // Validaciones básicas
       if (!userMessage || !domain || !userId) {
@@ -37,21 +41,45 @@ class ChatController {
         );
       }
 
-      logger.info(`[Chat] Processing message from user ${userId} on domain ${domain}`);
+      if (stream) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
 
-      // Procesar mensaje
-      const response = await this.orchestrator.processMessage({
-        userMessage,
-        userId,
-        domain,
-        forceModel,
-      });
+        // El orquestador se encargará de escribir en el stream y de la persistencia.
+        await this.orchestrator.processMessageStream({
+          userMessage,
+          userId,
+          domain,
+          forceModel,
+          res, // Pasamos el objeto de respuesta para el streaming
+        });
 
-      return ResponseUtil.success(res, response, 'Message processed successfully');
+        res.end();
+      } else {
+        // Procesamiento normal sin streaming
+        const response = await this.orchestrator.processMessage({
+          userMessage,
+          userId,
+          domain,
+          forceModel,
+        });
 
+        // Formatear respuesta según el formato esperado por el frontend
+        const assistantMessage = {
+          message: response.message || '',
+          audio_description: response.audio_description || response.message || '',
+          action: response.action || { type: 'none' },
+        };
+
+        return ResponseUtil.success(res, { assistantMessage }, 'Message processed successfully');
+      }
     } catch (error) {
       logger.error('[Chat] Error in sendMessage:', error);
-      return ResponseUtil.serverError(res, 'Failed to process message');
+      // Asegurarse de que no se envíe una respuesta de error si el stream ya comenzó
+      if (!res.headersSent) {
+        return ResponseUtil.serverError(res, 'Failed to process message');
+      }
     }
   }
 

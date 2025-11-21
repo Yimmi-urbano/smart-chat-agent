@@ -45,10 +45,17 @@ const productSchema = new mongoose.Schema({
   timestamps: true,
 });
 
-// Índice compuesto para búsquedas
+// OPTIMIZACIÓN MULTITENANT: Índices compuestos para búsquedas rápidas por dominio
+// Los índices deben empezar con domain (clave de partición multitenant)
 productSchema.index({ domain: 1, is_available: 1 });
 productSchema.index({ domain: 1, 'category.slug': 1 });
 productSchema.index({ domain: 1, title: 'text', description_short: 'text' });
+// Índice para búsquedas por slug (muy común)
+productSchema.index({ domain: 1, slug: 1 });
+// Índice para búsquedas por ID (muy común)
+productSchema.index({ domain: 1, _id: 1 });
+// Índice para búsquedas por tags
+productSchema.index({ domain: 1, tags: 1 });
 
 // Función lazy para obtener el modelo (se crea cuando se necesita)
 function getProductModel() {
