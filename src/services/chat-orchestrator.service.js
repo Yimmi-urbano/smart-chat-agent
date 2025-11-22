@@ -40,37 +40,14 @@ class ChatOrchestratorService {
    * @param {string} message - Mensaje del usuario
    * @returns {boolean}
    */
-  isFarewellMessage(message) {
-    if (!message || typeof message !== 'string') {
+  isFarewellMessage(toolResults) {
+    // ENFOQUE: La IA decide si es una despedida usando la herramienta is_farewell
+    // Ya no usamos expresiones regulares, confiamos en la decisión del LLM
+    if (!toolResults || toolResults.length === 0) {
       return false;
     }
 
-    const farewellPatterns = [
-      /^(adiós|chao|bye|hasta luego|nos vemos|hasta pronto)$/i,
-      /^(me voy|ya me voy|me retiro|me despido)$/i,
-      /^(gracias por todo|fue un gusto|fue un placer)$/i,
-      /^(hasta la próxima|hasta después|nos vemos luego)$/i,
-      /^(que tengas.*día|que tengas.*tarde|que tengas.*noche)$/i,
-      /^(hasta.*adiós|chao.*nos vemos)$/i,
-    ];
-
-    const messageLower = message.toLowerCase().trim();
-    
-    // Verificar patrones exactos
-    if (farewellPatterns.some(pattern => pattern.test(messageLower))) {
-      return true;
-    }
-
-    // Verificar si contiene palabras clave de despedida
-    const farewellKeywords = [
-      'adiós', 'chao', 'bye', 'hasta luego', 'nos vemos', 
-      'hasta pronto', 'me voy', 'me retiro', 'me despido',
-      'gracias por todo', 'fue un gusto', 'fue un placer',
-      'hasta la próxima', 'que tengas buen día', 'que tengas buena tarde',
-      'que tengas buena noche'
-    ];
-
-    return farewellKeywords.some(keyword => messageLower.includes(keyword));
+    return toolResults.some(tool => tool.functionName === 'is_farewell');
   }
 
   async processMessageStream({ userMessage, userId, domain, forceModel = null, res }) {
@@ -112,28 +89,20 @@ class ChatOrchestratorService {
                 if (!this.groqService) {
                     throw new Error('Groq service no está disponible. Configura GROQ_API_KEY y ENABLE_GROQ_FALLBACK=true');
                 }
-                // Groq no soporta streaming, usar respuesta normal y enviar completa
                 const groqResponse = await this.groqService.generateResponse(userMessage, history, domain, null);
                 usedModel = 'groq';
+                
+                // Simular streaming para Groq para una experiencia de usuario consistente
+                await this._pseudoStreamText(res, groqResponse.message);
+                
                 const toolsUsed = groqResponse.functionResults && groqResponse.functionResults.length > 0;
-                
-                // ENFOQUE: Function calling puro - La IA decide qué tools usar
-                // Confiamos completamente en la decisión de la IA, sin validación algorítmica
-                
-                // Enviar respuesta completa de una vez
-                if (!res.headersSent) {
-                    res.write(`data: ${JSON.stringify({ message: groqResponse.message })}\n\n`);
-                }
-                
-                // Continuar con la persistencia
-                const responseForPersistence = {
-                    message: groqResponse.message,
-                    usage: groqResponse.usage,
-                    usageMetadata: groqResponse.usageMetadata,
-                    functionResults: groqResponse.functionResults || [],
-                };
                 await this._finalizeAndPersistConversation({
-                    response: responseForPersistence,
+                    response: {
+                        message: groqResponse.message,
+                        usage: groqResponse.usage,
+                        usageMetadata: groqResponse.usageMetadata,
+                        functionResults: groqResponse.functionResults || [],
+                    },
                     conversation,
                     userMessage,
                     history,
@@ -187,10 +156,8 @@ class ChatOrchestratorService {
                     // ENFOQUE: Function calling puro - La IA decide qué tools usar
                     // Confiamos completamente en la decisión de la IA, sin validación algorítmica
                     
-                    // Enviar respuesta completa de una vez
-                    if (!res.headersSent) {
-                        res.write(`data: ${JSON.stringify({ message: groqResponse.message })}\n\n`);
-                    }
+                    // Simular streaming para una experiencia de usuario consistente
+                    await this._pseudoStreamText(res, groqResponse.message);
                     usedModel = 'groq';
                     
                     // Continuar con la persistencia
@@ -328,18 +295,17 @@ class ChatOrchestratorService {
         
         let history = this.getRecentHistory(conversation);
 
-        // Si es nueva sesión, agregar contexto para que la IA decida cómo saludar
+        // Si es una nueva sesión, agregar un contexto simple para que la IA sepa cómo saludar
         if (conversation._isNewSession && history.length === 0) {
-          // Es el primer mensaje de una nueva sesión
           const contextMessage = conversation._hasPreviousHistory
-            ? "CONTEXTO: El usuario está iniciando una nueva sesión de conversación. Este usuario ya ha tenido conversaciones previas en este sistema. Debes saludarlo con un mensaje de bienvenida de retorno, como 'Bienvenido nuevamente, estás de vuelta' o similar, de forma natural y amable."
-            : "CONTEXTO: El usuario está iniciando su primera conversación. Debes darle una bienvenida normal y amable como asistente de ventas.";
-          
-          // Agregar como mensaje de sistema al inicio del historial
-          history = [{
+            ? "CONTEXTO: Nueva sesión. El usuario ya tiene historial previo."
+            : "CONTEXTO: Nueva sesión. Es la primera conversación del usuario.";
+
+          // Agregar como mensaje de sistema al inicio del historial para que la IA lo vea
+          history.unshift({
             role: 'system',
             content: contextMessage,
-          }];
+          });
         }
 
         // NO construimos systemPrompt aquí, los agentes lo construirán dinámicamente
@@ -497,15 +463,16 @@ class ChatOrchestratorService {
     }
     
     // Validar que el mensaje incluya una pregunta (embudo de compra)
-    // EXCEPCIÓN: No validar si el usuario se está despidiendo
+    // EXCEPCIÓN: No validar si el usuario se está despidiendo (decidido por el LLM)
     const assistantMessage = response.message || '';
     const hasQuestion = assistantMessage.includes('?');
-    const isFarewell = this.isFarewellMessage(userMessage);
+    const isFarewell = this.isFarewellMessage(toolResults);
     
-    if (!hasQuestion && usedModel !== 'error_fallback' && !isFarewell) {
-        logger.warn(`[${FILE_NAME}] ⚠️ La respuesta no incluye una pregunta - debería incluir una para mantener el embudo de compra`);
-    } else if (isFarewell && !hasQuestion) {
-        logger.info(`[${FILE_NAME}] ✓ Respuesta de despedida detectada - no se requiere pregunta`);
+    if (isFarewell && !hasQuestion) {
+      logger.info(`[${FILE_NAME}] ✓ Respuesta de despedida detectada (vía tool is_farewell) - no se requiere pregunta`);
+    } else if (!hasQuestion && usedModel !== 'error_fallback' && !isFarewell) {
+      // Ya no es una advertencia crítica, solo una nota informativa
+      logger.info(`[${FILE_NAME}] ⓘ La respuesta no terminó en pregunta. Es aceptable si la conversación fluye naturalmente.`);
     }
 
     // Si el usuario se despidió, marcar la conversación como closed después de responder
@@ -604,7 +571,7 @@ class ChatOrchestratorService {
         promptLength: promptFull.length,
         systemPromptHash: promptHashForAudit,
         intent_interpreted: interpretedIntent,
-        tool_executed: toolResult,
+        tool_executed: toolResults || [], // Usar toolResults (plural) que es el array completo
     };
 
     // MEJORA: Extraer información de productos de functionResults para incluir en el historial
@@ -692,29 +659,30 @@ class ChatOrchestratorService {
         }
     }
 
-    // MEJORA: Enriquecer el contenido del mensaje del asistente con información de productos mencionados
-    // Esto permite que la IA tenga contexto de productos en mensajes siguientes
-    // IMPORTANTE: Limpiar el mensaje de la IA (remover [CONTEXTO_PRODUCTOS] si la IA lo incluyó)
-    let cleanMessage = (response.message || '').replace(/\[CONTEXTO_PRODUCTOS:[^\]]+\]/g, '').trim();
-    
-    let enrichedContent = cleanMessage;
-    if (uniqueProducts.length > 0) {
-        // Agregar información estructurada de productos al final del mensaje
-        // La IA podrá referenciar estos productos en mensajes siguientes
-        const productsInfo = uniqueProducts.map(p => 
-            `${p.title || 'Producto'} (ID: ${p.productId}${p.slug ? `, slug: ${p.slug}` : ''})`
-        ).join('; ');
-        
-        // Agregar nota contextual al final del mensaje (no visible para el usuario, pero útil para la IA)
-        enrichedContent += `\n\n[CONTEXTO_PRODUCTOS: ${productsInfo}]`;
-    }
+    // El mensaje del asistente se guarda limpio, sin contexto técnico adicional
+    const cleanMessage = (response.message || '').replace(/\[CONTEXTO_PRODUCTOS:[^\]]+\]/g, '').trim();
 
     conversation.messages.push({
         role: 'assistant',
-        content: enrichedContent, // Usar contenido enriquecido en el historial (con contexto)
+        content: cleanMessage, // Usar el mensaje limpio
         timestamp: new Date(),
         metadata: assistantMetadata,
     });
+
+    // MEJORA: El contexto del producto se inyecta como un mensaje de sistema separado.
+    // Se usa un formato simple y claro (tipo atributo) para que la IA lo pueda parsear fácilmente.
+    if (uniqueProducts.length > 0) {
+      const contextAttributes = uniqueProducts.map(p =>
+        `productId="${p.productId || ''}" slug="${p.slug || ''}" title="${p.title || ''}"`
+      ).join(' ');
+
+      conversation.messages.push({
+        role: 'system',
+        content: `[CONTEXTO ${contextAttributes}]`,
+        timestamp: new Date(),
+        metadata: { type: 'product_context' },
+      });
+    }
 
     // Asegurar que metadata existe (para conversaciones en memoria)
     if (!conversation.metadata) {
@@ -1057,21 +1025,12 @@ class ChatOrchestratorService {
       // Verificar si el último mensaje fue una despedida
       const messages = conversation.messages || [];
       let lastMessageWasFarewell = false;
-      
+
       if (messages.length > 0) {
         const lastMessage = messages[messages.length - 1];
-        // Verificar si el último mensaje del usuario o asistente fue una despedida
-        if (lastMessage.role === 'user') {
-          lastMessageWasFarewell = this.isFarewellMessage(lastMessage.content);
-        } else if (lastMessage.role === 'assistant') {
-          // Detectar despedidas del asistente (patrones comunes)
-          const assistantMessage = lastMessage.content.toLowerCase();
-          const farewellPatterns = [
-            /hasta luego/i, /hasta pronto/i, /nos vemos/i, /que tengas/i,
-            /fue un gusto/i, /fue un placer/i, /adiós/i, /chao/i, /bye/i,
-            /excelente día/i, /buen día/i, /buena tarde/i, /buena noche/i
-          ];
-          lastMessageWasFarewell = farewellPatterns.some(pattern => pattern.test(assistantMessage));
+        // Programación defensiva: asegurar que metadata y tool_executed existen y son un array
+        if (lastMessage.role === 'assistant' && lastMessage.metadata && Array.isArray(lastMessage.metadata.tool_executed)) {
+          lastMessageWasFarewell = lastMessage.metadata.tool_executed.some(tool => tool && tool.functionName === 'is_farewell');
         }
       }
 
@@ -1181,45 +1140,20 @@ class ChatOrchestratorService {
     // OPTIMIZACIÓN: Aumentar límite de caracteres para mantener contexto de productos
     const MAX_MESSAGE_LENGTH = 500; // Máximo 500 caracteres por mensaje (antes 300)
 
-    // Solo mensajes recientes (truncados), sin system prompt
-    // MEJORA: Incluir metadata en el historial para facilitar búsqueda de productos
-    const history = recentMessages.map((msg, index) => {
+    // Mapear los mensajes al formato de historial esperado, manteniendo el contenido limpio
+    const history = recentMessages.map(msg => {
       let content = msg.content || '';
-      const originalLength = content.length;
 
-      // MEJORA: Si el mensaje tiene información de productos mencionados, asegurar que esté en el contenido
-      // Esto ayuda a que el LLM tenga contexto de productos en mensajes anteriores
-      if (msg.metadata && msg.metadata.mentionedProducts && Array.isArray(msg.metadata.mentionedProducts)) {
-        // Si el contenido ya tiene [CONTEXTO_PRODUCTOS], no agregar de nuevo
-        if (!content.includes('[CONTEXTO_PRODUCTOS:')) {
-          const productsInfo = msg.metadata.mentionedProducts.map(p => 
-            `${p.title || 'Producto'} (ID: ${p.productId}${p.slug ? `, slug: ${p.slug}` : ''})`
-          ).join('; ');
-          content += `\n\n[CONTEXTO_PRODUCTOS: ${productsInfo}]`;
-        }
-      } else if (msg.metadata && msg.metadata.lastProductShown) {
-        // Fallback: si solo hay lastProductShown, agregarlo también
-        const productInfo = msg.metadata.lastProductShown;
-        if (!content.includes('[CONTEXTO_PRODUCTOS:') && !content.includes('[PRODUCTO_MENCIONADO:')) {
-          content += `\n\n[CONTEXTO_PRODUCTOS: ${productInfo.title || 'Producto'} (ID: ${productInfo.productId}${productInfo.slug ? `, slug: ${productInfo.slug}` : ''})]`;
-        }
-      } else if (msg.metadata && msg.metadata.action && msg.metadata.action.productId) {
-        // Fallback: si hay acción con producto, agregarlo también
-        const action = msg.metadata.action;
-        if (!content.includes('[CONTEXTO_PRODUCTOS:') && !content.includes('[PRODUCTO_ACCION:')) {
-          content += `\n\n[CONTEXTO_PRODUCTOS: ${action.title || 'Producto'} (ID: ${action.productId}${action.slug ? `, slug: ${action.slug}` : ''})]`;
-        }
-      }
-
-      // Truncar mensajes muy largos
+      // Truncar mensajes muy largos para optimizar tokens
       if (content.length > MAX_MESSAGE_LENGTH) {
         content = content.substring(0, MAX_MESSAGE_LENGTH) + '...';
       }
 
       return {
-      role: msg.role,
+        role: msg.role,
         content: content,
-        metadata: msg.metadata, // Incluir metadata para búsqueda
+        // Incluir metadata es útil para otras funciones de búsqueda en el historial
+        metadata: msg.metadata,
       };
     });
 
@@ -1777,6 +1711,25 @@ class ChatOrchestratorService {
     ]);
 
     return stats;
+  }
+
+  /**
+   * Simula un stream de texto para modelos que no lo soportan nativamente (como Groq)
+   * @param {object} res - El objeto de respuesta de Express
+   * @param {string} text - El texto completo a "streamear"
+   */
+  async _pseudoStreamText(res, text) {
+    const words = text.split(/(\s+)/); // Dividir por espacios, manteniendo los espacios
+    const delay = 50; // ms de retraso entre palabras para simular escritura
+
+    for (const word of words) {
+      if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ message: word })}\n\n`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        break; // Detener si el cliente cierra la conexión
+      }
+    }
   }
 }
 
